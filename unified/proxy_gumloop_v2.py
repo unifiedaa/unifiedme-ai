@@ -17,7 +17,6 @@ from .gumloop.tool_converter import convert_messages_with_tools, parse_tool_call
 from .proxy_gumloop import (
     _ensure_turnstile_key, _ext_from_media_type, _extract_image_data,
     _get_auth, _get_turnstile, _rehydrate_openai_messages_if_needed,
-    _update_rehydration_watermark,
 )
 
 log = logging.getLogger("unified.proxy_gumloop_v2")
@@ -554,8 +553,6 @@ def _stream_gumloop_v2(
             _stream_state["total_tokens"] = usage["total_tokens"]
             _stream_state["done"] = True
 
-            await _update_rehydration_watermark(chat_session_id, account_id)
-
         except Exception as e:
             log.error("Gumloop v2 streaming error: %s", e, exc_info=True)
             _stream_state["error"] = str(e)
@@ -626,7 +623,6 @@ async def _accumulate_gumloop_v2(
             "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens},
         }
-        await _update_rehydration_watermark(chat_session_id, account_id)
         return JSONResponse(response, status_code=200), 0.0
     except Exception as e:
         log.error("Gumloop v2 error: %s", e, exc_info=True)

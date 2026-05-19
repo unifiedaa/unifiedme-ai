@@ -20,7 +20,7 @@ from .proxy_kiro import proxy_chat_completions as kiro_proxy, proxy_messages as 
 from .proxy_codebuddy import proxy_chat_completions as codebuddy_proxy, get_stream_data, get_stream_credit
 from .proxy_skillboss import proxy_chat_completions as skillboss_proxy
 from .proxy_wavespeed import proxy_chat_completions as wavespeed_proxy
-from .proxy_gumloop import proxy_chat_completions as gumloop_proxy
+from .proxy_gumloop import proxy_chat_completions as gumloop_proxy, _update_rehydration_watermark
 from .proxy_gumloop_v2 import proxy_chat_completions as gumloop_v2_proxy
 from .proxy_windsurf import proxy_chat_completions as windsurf_proxy
 from .proxy_therouter import proxy_chat_completions as therouter_proxy
@@ -558,6 +558,7 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
                             content = gl_stream_state["content"]
                             if not prev or prev.get("role") != "assistant" or prev.get("content") != content:
                                 await db.add_chat_message(_chat_session_id, "assistant", content, _model)
+                            await _update_rehydration_watermark(_chat_session_id, _acct_id)
                         except Exception as e:
                             log.warning("Failed to persist direct Gumloop assistant stream for session %s: %s", _chat_session_id, e)
 
@@ -580,6 +581,7 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
                             prev = await db.get_last_chat_message(chat_session_id)
                             if not prev or prev.get("role") != "assistant" or prev.get("content") != content:
                                 await db.add_chat_message(chat_session_id, "assistant", content, model)
+                            await _update_rehydration_watermark(chat_session_id, account["id"])
                     except Exception as e:
                         log.warning("Failed to persist direct Gumloop assistant response for session %s: %s", chat_session_id, e)
             return response

@@ -93,6 +93,59 @@ async def add_message(session_id: int, request: Request, _: bool = Depends(verif
     return {"ok": True, "id": mid}
 
 
+@router.post("/opencode-sync")
+async def opencode_sync(request: Request):
+    client_host = (request.client.host if request.client else "") or ""
+    if client_host not in {"127.0.0.1", "::1", "localhost"}:
+        return JSONResponse({"error": "local only"}, status_code=403)
+
+    body = await request.json()
+    opencode_session_id = str(body.get("session_id", "")).strip()
+    opencode_message_id = str(body.get("message_id", "")).strip()
+    role = str(body.get("role", "")).strip()
+    content = str(body.get("content", "")).strip()
+    model = str(body.get("model", "")).strip()
+
+    if not opencode_session_id or role not in {"user", "assistant"} or not content:
+        return {"ok": True, "skipped": True}
+
+    chat_session_id = await db.get_or_create_chat_session_for_opencode_session(
+        opencode_session_id,
+        title=f"OpenCode {opencode_session_id}",
+        model=model,
+    )
+
+    existing = await db.get_chat_message_by_opencode_message_id(chat_session_id, opencode_message_id)
+    if existing:
+        return {"ok": True, "session_id": chat_session_id, "deduped": True}
+
+    prev = await db.get_last_chat_message(chat_session_id)
+    if not opencode_message_id and prev and prev.get("role") == role and prev.get("content") == content:
+        return {"ok": True, "session_id": chat_session_id, "deduped": True}
+
+    mid = await db.add_chat_message(chat_session_id, role, content, model, opencode_message_id=opencode_message_id)
+    return {"ok": True, "session_id": chat_session_id, "message_id": mid}
+
+
+@router.post("/opencode-sync/delete-session")
+async def opencode_sync_delete_session(request: Request):
+    client_host = (request.client.host if request.client else "") or ""
+    if client_host not in {"127.0.0.1", "::1", "localhost"}:
+        return JSONResponse({"error": "local only"}, status_code=403)
+
+    body = await request.json()
+    opencode_session_id = str(body.get("session_id", "")).strip()
+    if not opencode_session_id:
+        return {"ok": True, "skipped": True}
+
+    session = await db.get_chat_session_by_opencode_session_key(opencode_session_id)
+    if not session:
+        return {"ok": True, "deleted": False}
+
+    deleted = await db.delete_chat_session(int(session["id"]))
+    return {"ok": True, "deleted": bool(deleted)}
+
+
 # ─── Export / Import ─────────────────────────────────────────────────────────
 
 

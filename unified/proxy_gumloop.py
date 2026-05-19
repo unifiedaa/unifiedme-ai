@@ -376,12 +376,12 @@ async def _rehydrate_openai_messages_if_needed(db, chat_session_id: int | None, 
     """Returns (messages, rehydration_info) where rehydration_info has keys:
     - injected: bool
     - count: int (number of messages injected)
-    - mode: str ("delta" | "full" | "none")
+    - mode: str ("summary_delta" | "delta" | "none")
     """
     no_inject = (current_messages, {"injected": False, "count": 0, "mode": "none"})
 
     if not chat_session_id or not account_id:
-        log.info("[DEBUG-REHYDRATE] skip: chat_session_id=%s account_id=%s", chat_session_id, account_id)
+        log.info("[REHYDRATE] skip: no session or account (session=%s account=%s)", chat_session_id, account_id)
         return no_inject
 
     binding = await db.get_gumloop_binding_full(chat_session_id, account_id)
@@ -392,54 +392,105 @@ async def _rehydrate_openai_messages_if_needed(db, chat_session_id: int | None, 
             latest_id = await db.get_latest_session_message_id(chat_session_id)
             if latest_id:
                 await db.update_binding_watermark(chat_session_id, account_id, latest_id)
-            log.info("[DEBUG-REHYDRATE] legacy binding marked caught-up: session=%s account=%s latest_id=%s", chat_session_id, account_id, latest_id)
+            log.info("[REHYDRATE] same-account legacy binding marked caught-up: session=%s account=%s", chat_session_id, account_id)
             return no_inject
 
         delta_rows = await db.get_session_messages_after(chat_session_id, watermark)
         if not delta_rows:
-            log.info("[DEBUG-REHYDRATE] no delta: session=%s account=%s watermark=%s", chat_session_id, account_id, watermark)
+            log.info("[REHYDRATE] same-account no delta: session=%s account=%s watermark=%s", chat_session_id, account_id, watermark)
             return no_inject
 
         delta_messages = _persisted_rows_to_openai_messages(delta_rows)
         if not delta_messages:
-            log.info("[DEBUG-REHYDRATE] delta rows had no usable messages: session=%s account=%s watermark=%s rows=%s", chat_session_id, account_id, watermark, len(delta_rows))
+            log.info("[REHYDRATE] same-account delta rows empty after filter: session=%s", chat_session_id)
             return no_inject
 
         context_message = {"role": "system", "content": _render_delta_context(delta_messages)}
-        log.info("[DEBUG-REHYDRATE] delta inject: session=%s account=%s watermark=%s count=%s", chat_session_id, account_id, watermark, len(delta_messages))
+        log.info("[REHYDRATE] same-account delta inject: session=%s account=%s watermark=%s count=%s", chat_session_id, account_id, watermark, len(delta_messages))
         return [context_message, *current_messages], {"injected": True, "count": len(delta_messages), "mode": "delta"}
 
-    all_rows = await db.get_chat_messages(chat_session_id)
-    if not all_rows:
-        log.info("[DEBUG-REHYDRATE] first bind but no stored rows: session=%s account=%s", chat_session_id, account_id)
+    # --- First bind of a different account to this session ---
+    # Use summary + bounded recent window instead of full raw history
+    from .compactor import compact_messages, should_compact, _RECENT_WINDOW
+
+    summary_row = await db.get_session_summary(chat_session_id)
+    latest_id = await db.get_latest_session_message_id(chat_session_id)
+    total_count = await db.get_session_message_count(chat_session_id)
+
+    if total_count == 0:
+        log.info("[REHYDRATE] first-bind but no stored messages: session=%s account=%s", chat_session_id, account_id)
         return no_inject
 
-    persisted_messages = _persisted_rows_to_openai_messages(all_rows)
-    if not persisted_messages:
-        return no_inject
+    summary_watermark = summary_row["watermark_message_id"] if summary_row else 0
+    summary_text = summary_row["summary_text"] if summary_row else ""
 
-    merged = _merge_persisted_and_current_messages(persisted_messages, current_messages)
-    if not current_messages or len(merged) <= len(current_messages):
-        return no_inject
+    if total_count <= _RECENT_WINDOW and not summary_text:
+        all_rows = await db.get_chat_messages(chat_session_id)
+        summary_text = compact_messages(all_rows)
+        await db.upsert_session_summary(chat_session_id, summary_text, latest_id, total_count)
+        summary_watermark = latest_id
+        log.info("[REHYDRATE] first-bind small-history compacted directly: session=%s watermark=%s msg_count=%s", chat_session_id, latest_id, total_count)
 
-    prior_messages = merged[:-len(current_messages)]
-    if not prior_messages:
-        log.info("[DEBUG-REHYDRATE] first bind but no prior messages after overlap merge: session=%s account=%s", chat_session_id, account_id)
-        return no_inject
+    # Large history: use summary + recent window
+        if should_compact(total_count, summary_watermark, latest_id) or not summary_text:
+            all_rows = await db.get_chat_messages(chat_session_id)
+            summary_text = compact_messages(all_rows)
+            await db.upsert_session_summary(chat_session_id, summary_text, latest_id, total_count)
+            summary_watermark = latest_id
+        log.info("[REHYDRATE] regenerated summary: session=%s watermark=%s msg_count=%s summary_len=%s", chat_session_id, summary_watermark, total_count, len(summary_text))
 
-    context_message = {"role": "system", "content": _render_transcript_context(prior_messages)}
-    log.info("[DEBUG-REHYDRATE] full inject: session=%s account=%s count=%s stored_rows=%s", chat_session_id, account_id, len(prior_messages), len(all_rows))
-    return [context_message, *current_messages], {"injected": True, "count": len(prior_messages), "mode": "full"}
+    recent_rows = await db.get_session_messages_between(chat_session_id, max(0, summary_watermark - _RECENT_WINDOW), limit=_RECENT_WINDOW)
+    if not recent_rows:
+        recent_rows = await db.get_session_messages_after(chat_session_id, max(0, latest_id - _RECENT_WINDOW))
+
+    recent_messages = _persisted_rows_to_openai_messages(recent_rows) if recent_rows else []
+
+    context_parts = []
+    context_parts.append("You are continuing a conversation from the same OpenCode session but with a different upstream account.")
+    context_parts.append("Below is a compacted summary of prior conversation followed by recent messages.")
+    context_parts.append("")
+    context_parts.append("<session_summary>")
+    context_parts.append(summary_text)
+    context_parts.append("</session_summary>")
+
+    if recent_messages:
+        context_parts.append("")
+        context_parts.append("<recent_messages>")
+        for msg in recent_messages:
+            role = str(msg.get("role", "")).upper()
+            content = _message_text_for_overlap(msg.get("content", ""))
+            if content:
+                context_parts.append(f"{role}: {content}")
+        context_parts.append("</recent_messages>")
+
+    context_message = {"role": "system", "content": "\n".join(context_parts)}
+    inject_count = len(recent_messages) + 1
+    log.info("[REHYDRATE] first-bind summary+recent inject: session=%s account=%s summary_len=%s recent=%s total_stored=%s",
+             chat_session_id, account_id, len(summary_text), len(recent_messages), total_count)
+    return [context_message, *current_messages], {"injected": True, "count": inject_count, "mode": "summary_delta"}
 
 
 async def _update_rehydration_watermark(chat_session_id: int | None, account_id: int) -> None:
     if not chat_session_id or not account_id:
         return
     from . import database as db
+    from .compactor import compact_messages, should_compact
     try:
         latest_id = await db.get_latest_session_message_id(chat_session_id)
         if latest_id:
             await db.update_binding_watermark(chat_session_id, account_id, latest_id)
+            await db.update_chat_session(chat_session_id, last_gumloop_account_id=account_id)
+
+        total_count = await db.get_session_message_count(chat_session_id)
+        summary_row = await db.get_session_summary(chat_session_id)
+        summary_watermark = summary_row["watermark_message_id"] if summary_row else 0
+
+        if should_compact(total_count, summary_watermark, latest_id):
+            all_rows = await db.get_chat_messages(chat_session_id)
+            summary_text = compact_messages(all_rows)
+            await db.upsert_session_summary(chat_session_id, summary_text, latest_id, total_count)
+            log.info("[REHYDRATE] background summary update: session=%s watermark=%s msgs=%s",
+                     chat_session_id, latest_id, total_count)
     except Exception as e:
         log.warning("Failed to update rehydration watermark for session=%s account=%s: %s", chat_session_id, account_id, e)
 
@@ -883,8 +934,6 @@ def _stream_gumloop_toolaware(
             _stream_state["total_tokens"] = usage["total_tokens"]
             _stream_state["done"] = True
 
-            await _update_rehydration_watermark(chat_session_id, account_id)
-
         except Exception as e:
             log.error("Gumloop tool-aware streaming error: %s", e, exc_info=True)
             err = {"error": {"message": str(e) or "Stream error", "type": "proxy_error"}}
@@ -956,7 +1005,6 @@ async def _accumulate_gumloop_toolaware(
             "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens},
         }
-        await _update_rehydration_watermark(chat_session_id, account_id)
         return JSONResponse(response, status_code=200), 0.0
 
     except Exception as e:
@@ -1172,7 +1220,6 @@ def _stream_gumloop(
                     yield build_openai_done().encode()
                     _stream_state["content"] = full_text
                     _stream_state["done"] = True
-                    await _update_rehydration_watermark(chat_session_id, account_id)
                     break
 
                 # Ignore other events (step-start, keepalive, interaction-name-update, etc.)
@@ -1256,7 +1303,6 @@ async def _accumulate_gumloop(
                 "total_tokens": total_tokens,
             },
         }
-        await _update_rehydration_watermark(chat_session_id, account_id)
         return JSONResponse(response, status_code=200), 0.0
 
     except Exception as e:

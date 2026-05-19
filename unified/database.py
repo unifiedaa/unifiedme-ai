@@ -229,6 +229,7 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     opencode_session_key TEXT DEFAULT '',
     gumloop_account_id INTEGER DEFAULT 0,
     gumloop_interaction_id TEXT DEFAULT '',
+    last_gumloop_account_id INTEGER DEFAULT 0,
     created_at  TEXT DEFAULT (datetime('now')),
     updated_at  TEXT DEFAULT (datetime('now'))
 );
@@ -236,6 +237,7 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
 CREATE TABLE IF NOT EXISTS chat_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id INTEGER NOT NULL,
+    opencode_message_id TEXT DEFAULT '',
     role TEXT NOT NULL,                       -- system, user, assistant, thinking
     content TEXT NOT NULL DEFAULT '',
     model TEXT DEFAULT '',
@@ -255,6 +257,19 @@ CREATE TABLE IF NOT EXISTS gumloop_interaction_bindings (
 
 CREATE INDEX IF NOT EXISTS idx_gl_bindings_session ON gumloop_interaction_bindings(chat_session_id);
 CREATE INDEX IF NOT EXISTS idx_gl_bindings_account ON gumloop_interaction_bindings(account_id);
+
+CREATE TABLE IF NOT EXISTS gumloop_session_summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_session_id INTEGER NOT NULL,
+    summary_text TEXT NOT NULL DEFAULT '',
+    watermark_message_id INTEGER NOT NULL DEFAULT 0,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(chat_session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gl_summaries_session ON gumloop_session_summaries(chat_session_id);
 """
 
 
@@ -287,6 +302,8 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
         "ALTER TABLE chat_sessions ADD COLUMN opencode_session_key TEXT DEFAULT ''",
         "ALTER TABLE chat_sessions ADD COLUMN gumloop_account_id INTEGER DEFAULT 0",
         "ALTER TABLE chat_sessions ADD COLUMN gumloop_interaction_id TEXT DEFAULT ''",
+        "ALTER TABLE chat_sessions ADD COLUMN last_gumloop_account_id INTEGER DEFAULT 0",
+        "ALTER TABLE chat_messages ADD COLUMN opencode_message_id TEXT DEFAULT ''",
         # Last test error for review
         "ALTER TABLE accounts ADD COLUMN kiro_test_error TEXT DEFAULT ''",
         "ALTER TABLE accounts ADD COLUMN cb_test_error TEXT DEFAULT ''",
@@ -350,6 +367,17 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
         "ALTER TABLE opencode_session_registry ADD COLUMN last_model TEXT DEFAULT ''",
         # Delta rehydration watermark for Gumloop bindings
         "ALTER TABLE gumloop_interaction_bindings ADD COLUMN last_synced_message_id INTEGER DEFAULT NULL",
+        # Gumloop session summaries table (created via schema but migration ensures it exists on upgrade)
+        """CREATE TABLE IF NOT EXISTS gumloop_session_summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_session_id INTEGER NOT NULL,
+            summary_text TEXT NOT NULL DEFAULT '',
+            watermark_message_id INTEGER NOT NULL DEFAULT 0,
+            message_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(chat_session_id)
+        )""",
     ]
     for sql in migrations:
         try:
@@ -374,6 +402,13 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
         await conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_opencode_session_registry_api_key_id "
             "ON opencode_session_registry(api_key_id)"
+        )
+    except Exception:
+        pass
+    try:
+        await conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_messages_opencode_msg "
+            "ON chat_messages(session_id, opencode_message_id) WHERE opencode_message_id <> ''"
         )
     except Exception:
         pass
@@ -1930,17 +1965,29 @@ async def delete_chat_session(session_id: int) -> bool:
     return cur.rowcount > 0
 
 
-async def add_chat_message(session_id: int, role: str, content: str, model: str = "") -> int:
+async def add_chat_message(session_id: int, role: str, content: str, model: str = "", opencode_message_id: str = "") -> int:
     conn = await get_db()
     cur = await conn.execute(
-        "INSERT INTO chat_messages (session_id, role, content, model) VALUES (?, ?, ?, ?)",
-        (session_id, role, content, model),
+        "INSERT INTO chat_messages (session_id, opencode_message_id, role, content, model) VALUES (?, ?, ?, ?, ?)",
+        (session_id, opencode_message_id, role, content, model),
     )
     await conn.execute(
         "UPDATE chat_sessions SET updated_at = datetime('now') WHERE id = ?", (session_id,),
     )
     await conn.commit()
     return cur.lastrowid
+
+
+async def get_chat_message_by_opencode_message_id(session_id: int, opencode_message_id: str) -> Optional[dict]:
+    if not opencode_message_id:
+        return None
+    conn = await get_db()
+    cur = await conn.execute(
+        "SELECT * FROM chat_messages WHERE session_id = ? AND opencode_message_id = ? LIMIT 1",
+        (session_id, opencode_message_id),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
 
 
 async def get_chat_messages(session_id: int) -> list[dict]:
@@ -2021,42 +2068,40 @@ def _normalize_messages_for_match(messages: list[dict]) -> list[dict[str, str]]:
     return result
 
 
-async def infer_chat_session_id_from_messages(messages: list[dict], model: str = "") -> int:
+async def infer_chat_session_id_from_messages(messages: list[dict], model: str = "", opencode_session_key: str = "") -> int:
     """Infer the most likely existing chat session from the incoming message transcript.
 
-    Used when OpenCode doesn't send an explicit chat_session_id.
-    Matches by prefix so a growing transcript still maps to the same logical session.
+    SAFETY: Only matches sessions bound to the same opencode_session_key.
+    If no opencode_session_key is provided, returns 0 (refuses to guess broadly).
     Returns 0 if no match is found.
     """
+    if not opencode_session_key:
+        return 0
+
     incoming = _normalize_messages_for_match(messages)
     if not incoming:
         return 0
 
-    sessions = await get_chat_sessions()
-    # Prefer most recently updated sessions first, but only those matching model if provided.
-    if model:
-        sessions = [s for s in sessions if str(s.get("model", "")).strip() == str(model).strip() or not s.get("model")]
-    sessions.sort(key=lambda s: str(s.get("updated_at", "")), reverse=True)
+    existing = await get_chat_session_by_opencode_session_key(opencode_session_key)
+    if not existing:
+        return 0
 
-    best_session_id = 0
-    best_score = 0
+    sid = int(existing.get("id", 0) or 0)
+    if not sid:
+        return 0
 
-    for session in sessions:
-        sid = int(session.get("id", 0) or 0)
-        if not sid:
-            continue
-        transcript = await get_chat_messages(sid)
-        stored = _normalize_messages_for_match(transcript)
-        if not stored or len(stored) > len(incoming):
-            continue
-        if incoming[: len(stored)] != stored:
-            continue
-        score = len(stored)
-        if score > best_score:
-            best_score = score
-            best_session_id = sid
+    transcript = await get_chat_messages(sid)
+    stored = _normalize_messages_for_match(transcript)
+    if not stored:
+        return 0
 
-    return best_session_id
+    if len(stored) > len(incoming):
+        return 0
+
+    if incoming[:len(stored)] == stored:
+        return sid
+
+    return 0
 
 
 async def delete_all_chat_sessions() -> int:
@@ -2095,3 +2140,69 @@ async def import_chat_data(data: dict) -> int:
         imported += 1
     await conn.commit()
     return imported
+
+
+# ---------------------------------------------------------------------------
+# Gumloop session summaries (compacted history for cheaper continuity)
+# ---------------------------------------------------------------------------
+
+async def get_session_summary(chat_session_id: int) -> Optional[dict]:
+    conn = await get_db()
+    cur = await conn.execute(
+        "SELECT * FROM gumloop_session_summaries WHERE chat_session_id = ?",
+        (chat_session_id,),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def upsert_session_summary(
+    chat_session_id: int,
+    summary_text: str,
+    watermark_message_id: int,
+    message_count: int,
+) -> None:
+    conn = await get_db()
+    await conn.execute(
+        """INSERT INTO gumloop_session_summaries
+           (chat_session_id, summary_text, watermark_message_id, message_count)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(chat_session_id) DO UPDATE SET
+             summary_text = excluded.summary_text,
+             watermark_message_id = excluded.watermark_message_id,
+             message_count = excluded.message_count,
+             updated_at = datetime('now')""",
+        (chat_session_id, summary_text, watermark_message_id, message_count),
+    )
+    await conn.commit()
+
+
+async def get_session_messages_between(
+    session_id: int, after_id: int, limit: int = 50
+) -> list[dict]:
+    conn = await get_db()
+    cur = await conn.execute(
+        "SELECT * FROM chat_messages WHERE session_id = ? AND id > ? ORDER BY id ASC LIMIT ?",
+        (session_id, after_id, limit),
+    )
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def get_session_message_count(session_id: int) -> int:
+    conn = await get_db()
+    cur = await conn.execute(
+        "SELECT COUNT(*) as cnt FROM chat_messages WHERE session_id = ?",
+        (session_id,),
+    )
+    row = await cur.fetchone()
+    return row["cnt"] if row else 0
+
+
+async def get_last_gumloop_account_id(chat_session_id: int) -> int:
+    session = await get_chat_session(chat_session_id)
+    if not session:
+        return 0
+    try:
+        return int(session.get("last_gumloop_account_id", 0) or 0)
+    except Exception:
+        return 0
