@@ -147,6 +147,8 @@ async def proxy_chat_completions(
             ), 0.0
 
     # Streaming: passthrough SSE with model name restoration
+    _stream_state = {"content": "", "done": False}
+
     async def stream_generator() -> AsyncIterator[bytes]:
         try:
             async for line in upstream_resp.aiter_lines():
@@ -161,6 +163,9 @@ async def proxy_chat_completions(
                     try:
                         chunk = json.loads(data_str)
                         chunk["model"] = original_model
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        if delta.get("content"):
+                            _stream_state["content"] += delta["content"]
                         yield f"data: {json.dumps(chunk)}\n\n".encode()
                     except (json.JSONDecodeError, ValueError):
                         yield f"{line}\n".encode()
@@ -170,12 +175,15 @@ async def proxy_chat_completions(
             log.error("TheRouter stream error: %s", e)
         finally:
             await upstream_resp.aclose()
+            _stream_state["done"] = True
 
-    return StreamingResponse(
+    resp = StreamingResponse(
         stream_generator(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         },
-    ), 0.0
+    )
+    resp._ws_stream_state = _stream_state  # pyright: ignore[reportAttributeAccessIssue]
+    return resp, 0.0

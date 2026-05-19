@@ -17,6 +17,7 @@ from .gumloop.tool_converter import convert_messages_with_tools, parse_tool_call
 from .proxy_gumloop import (
     _ensure_turnstile_key, _ext_from_media_type, _extract_image_data,
     _get_auth, _get_turnstile, _rehydrate_openai_messages_if_needed,
+    _update_rehydration_watermark,
 )
 
 log = logging.getLogger("unified.proxy_gumloop_v2")
@@ -211,19 +212,6 @@ async def proxy_chat_completions(
     interaction_id = None
     chat_session_id = body.get("chat_session_id")
 
-    if not chat_session_id:
-        inferred_session_id = await db.infer_chat_session_id_from_messages(messages, raw_model)
-        if inferred_session_id:
-            chat_session_id = inferred_session_id
-            log.info("Inferred OpenCode session_id=%s for Gumloop v2 routing", chat_session_id)
-
-    if not chat_session_id and account_id:
-        try:
-            chat_session_id = await db.get_or_create_gumloop_session_for_account(account_id)
-            log.info("Auto-assigned persistent session %s for account %s", chat_session_id, account_id)
-        except Exception as e:
-            log.warning("Failed to auto-create session for account %s: %s", account_id, e)
-
     session_id_int = 0
     if chat_session_id and account_id:
         try:
@@ -235,7 +223,7 @@ async def proxy_chat_completions(
         except (TypeError, ValueError) as e:
             log.warning("Invalid chat_session_id '%s': %s", chat_session_id, e)
 
-    messages = await _rehydrate_openai_messages_if_needed(
+    messages, rehydration_info = await _rehydrate_openai_messages_if_needed(
         db,
         session_id_int if session_id_int else None,
         account_id,
@@ -300,6 +288,8 @@ async def proxy_chat_completions(
             proxy_url,
             account_id=account.get("id", 0),
             account_email=account.get("email", "?"),
+            chat_session_id=session_id_int or None,
+            rehydration_info=rehydration_info,
         ), 0.0
 
     return await _accumulate_gumloop_v2(
@@ -312,6 +302,8 @@ async def proxy_chat_completions(
         created,
         interaction_id,
         proxy_url,
+        chat_session_id=session_id_int or None,
+        account_id=account_id,
     )
 
 
@@ -365,6 +357,8 @@ def _stream_gumloop_v2(
     proxy_url: str | None,
     account_id: int = 0,
     account_email: str = "?",
+    chat_session_id: int | None = None,
+    rehydration_info: dict[str, Any] | None = None,
 ) -> StreamingResponse:
     _stream_state: dict[str, Any] = {
         "cost": 0.0,
@@ -543,6 +537,13 @@ def _stream_gumloop_v2(
                     created=created,
                 ).encode()
 
+            if rehydration_info and rehydration_info.get("injected"):
+                mode = rehydration_info.get("mode", "delta")
+                count = rehydration_info.get("count", 0)
+                status_msg = f"\n\n_[Context synced: {count} messages injected ({mode})]_"
+                yield build_openai_chunk(stream_id, display_model, content=status_msg, created=created).encode()
+                full_text += status_msg
+
             finish_reason = "tool_calls" if tool_uses else "stop"
             yield build_openai_chunk(stream_id, display_model, finish_reason=finish_reason, created=created, usage=usage).encode()
             yield build_openai_done().encode()
@@ -552,6 +553,8 @@ def _stream_gumloop_v2(
             _stream_state["completion_tokens"] = usage["completion_tokens"]
             _stream_state["total_tokens"] = usage["total_tokens"]
             _stream_state["done"] = True
+
+            await _update_rehydration_watermark(chat_session_id, account_id)
 
         except Exception as e:
             log.error("Gumloop v2 streaming error: %s", e, exc_info=True)
@@ -582,6 +585,8 @@ async def _accumulate_gumloop_v2(
     created: int,
     interaction_id: str,
     proxy_url: str | None,
+    chat_session_id: int | None = None,
+    account_id: int = 0,
 ) -> tuple[JSONResponse, float]:
     try:
         full_text = ""
@@ -621,6 +626,7 @@ async def _accumulate_gumloop_v2(
             "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens},
         }
+        await _update_rehydration_watermark(chat_session_id, account_id)
         return JSONResponse(response, status_code=200), 0.0
     except Exception as e:
         log.error("Gumloop v2 error: %s", e, exc_info=True)

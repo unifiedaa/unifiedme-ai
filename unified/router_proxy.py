@@ -30,6 +30,10 @@ from . import license_client
 
 log = logging.getLogger("unified.router_proxy")
 
+# Retry counters — module-level dicts instead of function attributes (pyright compat)
+_cbai_auth_retries: dict[str, int] = {}
+_cb_400_count: dict[str, int] = {}
+
 router = APIRouter(prefix="/v1", tags=["proxy"])
 
 # Max chars to capture for response body in logs
@@ -71,6 +75,24 @@ def _extract_response_body(response) -> str:
     return ""
 
 
+async def _persist_assistant_response(chat_session_id: int, response, model: str) -> None:
+    if not chat_session_id:
+        return
+    try:
+        raw_body = getattr(response, 'body', b'')
+        if not raw_body:
+            return
+        data = json.loads(raw_body.decode('utf-8', errors='replace'))
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if not content:
+            return
+        prev = await db.get_last_chat_message(chat_session_id)
+        if not prev or prev.get("role") != "assistant" or prev.get("content") != content:
+            await db.add_chat_message(chat_session_id, "assistant", content, model)
+    except Exception as e:
+        log.warning("Failed to persist assistant response for session %s: %s", chat_session_id, e)
+
+
 @router.post("/chat/completions")
 async def chat_completions(request: Request, key_info: dict = Depends(verify_api_key)):
     """Route chat completion requests to the appropriate upstream based on model tier."""
@@ -103,19 +125,10 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
         or str(request.headers.get("x-opencode-session-id", "")).strip()
         or str(request.headers.get("x-opencode-session-key", "")).strip()
     )
-    if not opencode_session_key:
-        workspace_dir = (
-            str(body.get("working_directory", "")).strip()
-            or str(body.get("working_dir", "")).strip()
-            or str(body.get("directory", "")).strip()
-            or str(request.headers.get("x-opencode-working-directory", "")).strip()
-            or str(request.headers.get("x-opencode-working-dir", "")).strip()
-            or str(Path.cwd())
-        )
-        try:
-            opencode_session_key = await db.find_opencode_session_key_for_workspace(workspace_dir)
-        except Exception:
-            opencode_session_key = ""
+    log.info("[DEBUG-SESSION] opencode_session_key=%r, header=%r, body_keys=%s",
+             opencode_session_key,
+             request.headers.get("x-opencode-session-id", ""),
+             [k for k in body.keys() if "session" in k.lower()])
     if opencode_session_key and not body.get("chat_session_id"):
         try:
             chat_session_id = await db.get_or_create_chat_session_for_opencode_session(
@@ -127,6 +140,8 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
             log.info("Bound OpenCode session %s -> chat_session_id=%s", opencode_session_key, chat_session_id)
         except Exception as e:
             log.warning("Failed to bind OpenCode session %s: %s", opencode_session_key, e)
+    elif not opencode_session_key:
+        log.info("[DEBUG-SESSION] No explicit OpenCode session id provided; request will stay stateless unless chat_session_id is already present")
 
     tier = get_tier(model)
     if tier is None:
@@ -147,6 +162,25 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
     # Capture request info for logging (after filter, so logs show filtered body)
     req_headers_str = _capture_request_headers(request)
     req_body_str = body_bytes.decode("utf-8", errors="replace")[:_MAX_RESPONSE_BODY]
+
+    # Persist user message for ALL tiers (enables cross-model delta rehydration)
+    chat_session_id_global = 0
+    try:
+        chat_session_id_global = int(body.get("chat_session_id") or 0)
+    except Exception:
+        pass
+    if chat_session_id_global and tier != Tier.MAX_GL:
+        try:
+            req_messages = body.get("messages", []) or []
+            last_user = req_messages[-1] if req_messages and isinstance(req_messages[-1], dict) else None
+            if last_user and last_user.get("role") == "user":
+                last_content = last_user.get("content", "")
+                if isinstance(last_content, str) and last_content.strip():
+                    prev = await db.get_last_chat_message(chat_session_id_global)
+                    if not prev or prev.get("role") != "user" or prev.get("content") != last_content:
+                        await db.add_chat_message(chat_session_id_global, "user", last_content, model)
+        except Exception as e:
+            log.warning("Failed to persist user message for session %s: %s", chat_session_id_global, e)
 
     if tier == Tier.STANDARD:
         # Route to Kiro API — instant rotation on failure
@@ -214,6 +248,8 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
                 response_headers=resp_headers_str, response_body=resp_body_str,
                 error_message=error_msg, proxy_url=proxy_url or "",
             )
+            if chat_session_id_global and status < 400 and not client_wants_stream:
+                await _persist_assistant_response(chat_session_id_global, response, model)
             return response
 
         # All Kiro retries exhausted
@@ -335,6 +371,11 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
                         error_message=error_msg,
                         proxy_url=_proxy_url,
                     )
+                    if chat_session_id_global and ws_stream_state.get("content"):
+                        content = ws_stream_state["content"]
+                        prev = await db.get_last_chat_message(chat_session_id_global)
+                        if not prev or prev.get("role") != "assistant" or prev.get("content") != content:
+                            await db.add_chat_message(chat_session_id_global, "assistant", content, model)
 
                 response.background = BackgroundTask(_post_ws_stream_log)
             else:
@@ -346,6 +387,8 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
                     error_message=error_msg,
                     proxy_url=proxy_url or "",
                 )
+            if chat_session_id_global and status < 400 and not client_wants_stream:
+                await _persist_assistant_response(chat_session_id_global, response, model)
             return response
 
         # All WaveSpeed retries exhausted
@@ -380,22 +423,19 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
                         title=body.get("session_title", "New Chat"),
                         model=model,
                     )
-                else:
-                    chat_session_id = await db.get_or_create_chat_session_for_api_key(
-                        key_info["id"],
-                        title=body.get("session_title", "New Chat"),
-                        model=model,
-                    )
-                body["chat_session_id"] = chat_session_id
-                log.info("Sticky session resolved for api_key_id=%s -> chat_session_id=%s", key_info["id"], chat_session_id)
+                    body["chat_session_id"] = chat_session_id
+                    log.info("Bound Gumloop OpenCode session %s -> chat_session_id=%s", opencode_session_key, chat_session_id)
             except Exception as e:
-                log.warning("Failed to resolve sticky session for api_key_id=%s: %s", key_info["id"], e)
+                log.warning("Failed to bind Gumloop OpenCode session %s: %s", opencode_session_key, e)
+        elif not body.get("chat_session_id"):
+            log.info("[DEBUG-SESSION] Gumloop request has no explicit OpenCode session id; skipping sticky session fallback")
 
         chat_session_id = 0
         try:
             chat_session_id = int(body.get("chat_session_id") or 0)
         except Exception:
             chat_session_id = 0
+        log.info("[DEBUG-SESSION] Gumloop effective chat_session_id=%s for model=%s", chat_session_id, model)
 
         if chat_session_id:
             try:
@@ -579,18 +619,15 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
             error_msg = ""
 
             if status in (401, 403):
-                # Retry same account once after 4s — might be transient
-                if not hasattr(chat_completions, '_cbai_auth_retries'):
-                    chat_completions._cbai_auth_retries = {}
                 rkey = f"{account['id']}_{model}"
-                chat_completions._cbai_auth_retries.setdefault(rkey, 0)
-                chat_completions._cbai_auth_retries[rkey] += 1
-                if chat_completions._cbai_auth_retries[rkey] <= 3:
-                    log.warning("ChatBAI %s HTTP %d, retry %d/3 in 4s", account["email"], status, chat_completions._cbai_auth_retries[rkey])
+                _cbai_auth_retries.setdefault(rkey, 0)
+                _cbai_auth_retries[rkey] += 1
+                if _cbai_auth_retries[rkey] <= 3:
+                    log.warning("ChatBAI %s HTTP %d, retry %d/3 in 4s", account["email"], status, _cbai_auth_retries[rkey])
                     await asyncio.sleep(4)
                     tried_cbai_ids.pop()
                     continue
-                chat_completions._cbai_auth_retries[rkey] = 0
+                _cbai_auth_retries[rkey] = 0
                 error_msg = f"ChatBAI HTTP {status} (account: {account['email']})"
                 resp_body_str = getattr(response, '_ws_raw_body', '') or _extract_response_body(response)
                 await db.update_account(account["id"], cbai_status="banned", cbai_error=error_msg)
@@ -687,6 +724,11 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
                         error_message=error_msg,
                         proxy_url=_proxy_url,
                     )
+                    if chat_session_id_global and cbai_stream_state.get("content"):
+                        content = cbai_stream_state["content"]
+                        prev = await db.get_last_chat_message(chat_session_id_global)
+                        if not prev or prev.get("role") != "assistant" or prev.get("content") != content:
+                            await db.add_chat_message(chat_session_id_global, "assistant", content, model)
 
                 response.background = BackgroundTask(_post_cbai_stream_log)
             else:
@@ -698,6 +740,8 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
                     error_message=error_msg,
                     proxy_url=proxy_url or "",
                 )
+            if chat_session_id_global and status < 400 and not client_wants_stream:
+                await _persist_assistant_response(chat_session_id_global, response, model)
             return response
 
         # All ChatBAI retries exhausted
@@ -802,6 +846,8 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
                 response_headers=resp_headers_str, response_body=resp_body_str,
                 error_message=error_msg, proxy_url=proxy_url or "",
             )
+            if chat_session_id_global and status < 400 and not client_wants_stream:
+                await _persist_assistant_response(chat_session_id_global, response, model)
             return response
 
         # All SkillBoss retries exhausted
@@ -948,6 +994,11 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
                         error_message=error_msg,
                         proxy_url=_proxy_url,
                     )
+                    if chat_session_id_global and windsurf_stream_state.get("content"):
+                        content = windsurf_stream_state["content"]
+                        prev = await db.get_last_chat_message(chat_session_id_global)
+                        if not prev or prev.get("role") != "assistant" or prev.get("content") != content:
+                            await db.add_chat_message(chat_session_id_global, "assistant", content, model)
 
                 response.background = BackgroundTask(_post_windsurf_stream_log)
             else:
@@ -959,6 +1010,8 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
                     error_message=error_msg,
                     proxy_url=proxy_url or "",
                 )
+            if chat_session_id_global and status < 400 and not client_wants_stream:
+                await _persist_assistant_response(chat_session_id_global, response, model)
             return response
 
         # All Windsurf retries exhausted
@@ -1060,6 +1113,26 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
                 response_headers=resp_headers_str, response_body=resp_body_str,
                 error_message=error_msg, proxy_url=proxy_url or "",
             )
+            if chat_session_id_global and status < 400 and not client_wants_stream:
+                await _persist_assistant_response(chat_session_id_global, response, model)
+            if chat_session_id_global and status < 400 and client_wants_stream:
+                tr_stream_state = getattr(response, '_ws_stream_state', None)
+                if tr_stream_state is not None:
+                    from starlette.background import BackgroundTask
+
+                    async def _post_tr_stream_persist():
+                        import asyncio as _aio
+                        for _ in range(60):
+                            if tr_stream_state.get("done"):
+                                break
+                            await _aio.sleep(0.5)
+                        if tr_stream_state.get("content"):
+                            content = tr_stream_state["content"]
+                            prev = await db.get_last_chat_message(chat_session_id_global)
+                            if not prev or prev.get("role") != "assistant" or prev.get("content") != content:
+                                await db.add_chat_message(chat_session_id_global, "assistant", content, model)
+
+                    response.background = BackgroundTask(_post_tr_stream_persist)
             return response
 
         # All TheRouter retries exhausted
@@ -1163,21 +1236,17 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
             resp_body_str = _extract_response_body(response)
             is_transient_400 = "11133" in resp_body_str or "11101" in resp_body_str
             if is_transient_400:
-                _cb_400_retries = getattr(response, '_cb_400_retries', 0)
-                if not hasattr(chat_completions, '_cb_400_count'):
-                    chat_completions._cb_400_count = {}
                 retry_key = f"{account['id']}_{model}"
-                chat_completions._cb_400_count.setdefault(retry_key, 0)
-                chat_completions._cb_400_count[retry_key] += 1
-                if chat_completions._cb_400_count[retry_key] <= 10:
+                _cb_400_count.setdefault(retry_key, 0)
+                _cb_400_count[retry_key] += 1
+                if _cb_400_count[retry_key] <= 10:
                     log.warning("CB %s transient 400 (attempt %d/10), retry in 4s",
-                                account["email"], chat_completions._cb_400_count[retry_key])
+                                account["email"], _cb_400_count[retry_key])
                     await asyncio.sleep(4)
-                    # Don't increment tried_account_ids — retry same account
                     tried_account_ids.pop()
                     continue
                 else:
-                    chat_completions._cb_400_count[retry_key] = 0
+                    _cb_400_count[retry_key] = 0
             error_msg = f"CodeBuddy HTTP 400 bad request (not account error)"
         elif status >= 500:
             error_msg = f"CodeBuddy HTTP {status} server error (account: {account['email']})"
@@ -1210,6 +1279,11 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
                     response_headers=resp_headers_str, response_body=log_body,
                     error_message=error_msg, proxy_url=_proxy_url,
                 )
+                if chat_session_id_global and stream_data.get("content"):
+                    content = stream_data["content"]
+                    prev = await db.get_last_chat_message(chat_session_id_global)
+                    if not prev or prev.get("role") != "assistant" or prev.get("content") != content:
+                        await db.add_chat_message(chat_session_id_global, "assistant", content, model)
 
             response.background = BackgroundTask(_post_stream_log)
         else:
@@ -1227,6 +1301,8 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
                 response_headers=resp_headers_str, response_body=resp_body_str,
                 error_message=error_msg, proxy_url=proxy_url or "",
             )
+        if chat_session_id_global and status < 400 and not client_wants_stream:
+            await _persist_assistant_response(chat_session_id_global, response, model)
         return response
 
     # All retries exhausted — log with full detail

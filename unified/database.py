@@ -348,6 +348,8 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
         "ALTER TABLE usage_logs ADD COLUMN proxy_url TEXT DEFAULT ''",
         # OpenCode session registry
         "ALTER TABLE opencode_session_registry ADD COLUMN last_model TEXT DEFAULT ''",
+        # Delta rehydration watermark for Gumloop bindings
+        "ALTER TABLE gumloop_interaction_bindings ADD COLUMN last_synced_message_id INTEGER DEFAULT NULL",
     ]
     for sql in migrations:
         try:
@@ -1815,17 +1817,16 @@ async def get_gumloop_binding(chat_session_id: int, account_id: int) -> str:
     return row["interaction_id"] if row else ""
 
 
-async def create_gumloop_binding(chat_session_id: int, account_id: int, interaction_id: str) -> None:
+async def create_gumloop_binding(chat_session_id: int, account_id: int, interaction_id: str, last_synced_message_id: int | None = None) -> None:
     """Create a (chat_session, account) -> interaction_id binding. Ignores duplicates."""
     conn = await get_db()
     try:
         await conn.execute(
-            "INSERT INTO gumloop_interaction_bindings (chat_session_id, account_id, interaction_id) VALUES (?,?,?)",
-            (chat_session_id, account_id, interaction_id),
+            "INSERT INTO gumloop_interaction_bindings (chat_session_id, account_id, interaction_id, last_synced_message_id) VALUES (?,?,?,?)",
+            (chat_session_id, account_id, interaction_id, last_synced_message_id),
         )
         await conn.commit()
     except Exception:
-        # UNIQUE constraint violation — binding already exists, update it
         await conn.execute(
             "UPDATE gumloop_interaction_bindings SET interaction_id =?, updated_at = datetime('now') WHERE chat_session_id =? AND account_id =?",
             (interaction_id, chat_session_id, account_id),
@@ -1863,6 +1864,44 @@ async def get_all_gumloop_bindings_for_session(chat_session_id: int) -> list[dic
         (chat_session_id,),
     )
     return [dict(r) for r in await cur.fetchall()]
+
+
+async def get_gumloop_binding_full(chat_session_id: int, account_id: int) -> dict | None:
+    conn = await get_db()
+    cur = await conn.execute(
+        "SELECT * FROM gumloop_interaction_bindings WHERE chat_session_id =? AND account_id =?",
+        (chat_session_id, account_id),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def get_session_messages_after(session_id: int, after_message_id: int) -> list[dict]:
+    conn = await get_db()
+    cur = await conn.execute(
+        "SELECT * FROM chat_messages WHERE session_id = ? AND id > ? ORDER BY id ASC",
+        (session_id, after_message_id),
+    )
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def get_latest_session_message_id(session_id: int) -> int:
+    conn = await get_db()
+    cur = await conn.execute(
+        "SELECT MAX(id) as max_id FROM chat_messages WHERE session_id = ?",
+        (session_id,),
+    )
+    row = await cur.fetchone()
+    return (row["max_id"] or 0) if row else 0
+
+
+async def update_binding_watermark(chat_session_id: int, account_id: int, last_synced_message_id: int) -> None:
+    conn = await get_db()
+    await conn.execute(
+        "UPDATE gumloop_interaction_bindings SET last_synced_message_id = ?, updated_at = datetime('now') WHERE chat_session_id = ? AND account_id = ?",
+        (last_synced_message_id, chat_session_id, account_id),
+    )
+    await conn.commit()
 
 
 async def update_chat_session(session_id: int, **fields: Any) -> bool:

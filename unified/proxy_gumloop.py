@@ -356,30 +356,92 @@ def _render_transcript_context(messages: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def _rehydrate_openai_messages_if_needed(db, chat_session_id: int | None, account_id: int, current_messages: list[dict]) -> list[dict]:
+def _render_delta_context(messages: list[dict]) -> str:
+    lines = [
+        "The following conversation occurred while you were not the active model. Use this as context to continue naturally:",
+        "",
+        "<delta_history>",
+    ]
+    for msg in messages:
+        role = str(msg.get("role", "")).strip().upper() or "USER"
+        content = _message_text_for_overlap(msg.get("content", ""))
+        if not content:
+            continue
+        lines.append(f"{role}: {content}")
+    lines.append("</delta_history>")
+    return "\n".join(lines)
+
+
+async def _rehydrate_openai_messages_if_needed(db, chat_session_id: int | None, account_id: int, current_messages: list[dict]) -> tuple[list[dict], dict]:
+    """Returns (messages, rehydration_info) where rehydration_info has keys:
+    - injected: bool
+    - count: int (number of messages injected)
+    - mode: str ("delta" | "full" | "none")
+    """
+    no_inject = (current_messages, {"injected": False, "count": 0, "mode": "none"})
+
     if not chat_session_id or not account_id:
-        return current_messages
-    session_row = await db.get_chat_session(chat_session_id)
-    opencode_session_key = (session_row or {}).get("opencode_session_key", "")
-    existing_binding = await db.get_gumloop_binding(chat_session_id, account_id)
-    if existing_binding:
-        return current_messages
-    if opencode_session_key:
-        transcript = await db.load_opencode_transcript(opencode_session_key)
-        persisted_messages = transcript.get("messages", []) or []
-    else:
-        transcript = await db.get_chat_session_transcript(chat_session_id)
-        persisted_messages = _persisted_rows_to_openai_messages(transcript.get("messages", []))
+        log.info("[DEBUG-REHYDRATE] skip: chat_session_id=%s account_id=%s", chat_session_id, account_id)
+        return no_inject
+
+    binding = await db.get_gumloop_binding_full(chat_session_id, account_id)
+
+    if binding:
+        watermark = binding.get("last_synced_message_id")
+        if watermark is None:
+            latest_id = await db.get_latest_session_message_id(chat_session_id)
+            if latest_id:
+                await db.update_binding_watermark(chat_session_id, account_id, latest_id)
+            log.info("[DEBUG-REHYDRATE] legacy binding marked caught-up: session=%s account=%s latest_id=%s", chat_session_id, account_id, latest_id)
+            return no_inject
+
+        delta_rows = await db.get_session_messages_after(chat_session_id, watermark)
+        if not delta_rows:
+            log.info("[DEBUG-REHYDRATE] no delta: session=%s account=%s watermark=%s", chat_session_id, account_id, watermark)
+            return no_inject
+
+        delta_messages = _persisted_rows_to_openai_messages(delta_rows)
+        if not delta_messages:
+            log.info("[DEBUG-REHYDRATE] delta rows had no usable messages: session=%s account=%s watermark=%s rows=%s", chat_session_id, account_id, watermark, len(delta_rows))
+            return no_inject
+
+        context_message = {"role": "system", "content": _render_delta_context(delta_messages)}
+        log.info("[DEBUG-REHYDRATE] delta inject: session=%s account=%s watermark=%s count=%s", chat_session_id, account_id, watermark, len(delta_messages))
+        return [context_message, *current_messages], {"injected": True, "count": len(delta_messages), "mode": "delta"}
+
+    all_rows = await db.get_chat_messages(chat_session_id)
+    if not all_rows:
+        log.info("[DEBUG-REHYDRATE] first bind but no stored rows: session=%s account=%s", chat_session_id, account_id)
+        return no_inject
+
+    persisted_messages = _persisted_rows_to_openai_messages(all_rows)
     if not persisted_messages:
-        return current_messages
+        return no_inject
+
     merged = _merge_persisted_and_current_messages(persisted_messages, current_messages)
     if not current_messages or len(merged) <= len(current_messages):
-        return current_messages
+        return no_inject
+
     prior_messages = merged[:-len(current_messages)]
     if not prior_messages:
-        return current_messages
+        log.info("[DEBUG-REHYDRATE] first bind but no prior messages after overlap merge: session=%s account=%s", chat_session_id, account_id)
+        return no_inject
+
     context_message = {"role": "system", "content": _render_transcript_context(prior_messages)}
-    return [context_message, *current_messages]
+    log.info("[DEBUG-REHYDRATE] full inject: session=%s account=%s count=%s stored_rows=%s", chat_session_id, account_id, len(prior_messages), len(all_rows))
+    return [context_message, *current_messages], {"injected": True, "count": len(prior_messages), "mode": "full"}
+
+
+async def _update_rehydration_watermark(chat_session_id: int | None, account_id: int) -> None:
+    if not chat_session_id or not account_id:
+        return
+    from . import database as db
+    try:
+        latest_id = await db.get_latest_session_message_id(chat_session_id)
+        if latest_id:
+            await db.update_binding_watermark(chat_session_id, account_id, latest_id)
+    except Exception as e:
+        log.warning("Failed to update rehydration watermark for session=%s account=%s: %s", chat_session_id, account_id, e)
 
 
 async def _get_or_create_session_for_account(account_id: int, db) -> int:
@@ -449,20 +511,6 @@ async def proxy_chat_completions(
     interaction_id = None
     chat_session_id = body.get("chat_session_id")
 
-    if not chat_session_id:
-        inferred_session_id = await db.infer_chat_session_id_from_messages(messages, raw_model)
-        if inferred_session_id:
-            chat_session_id = inferred_session_id
-            log.info("Inferred OpenCode session_id=%s for Gumloop routing", chat_session_id)
-
-    if not chat_session_id and account_id:
-        try:
-            session_id = await _get_or_create_session_for_account(account_id, db)
-            chat_session_id = session_id
-            log.info("Auto-assigned persistent session %s for account %s", session_id, account_id)
-        except Exception as e:
-            log.warning("Failed to auto-create session for account %s: %s", account_id, e)
-
     existing_binding = ""
     session_id_int = 0
     if chat_session_id and account_id:
@@ -475,7 +523,7 @@ async def proxy_chat_completions(
         except (ValueError, TypeError) as e:
             log.warning("Invalid chat_session_id '%s': %s", chat_session_id, e)
 
-    messages = await _rehydrate_openai_messages_if_needed(
+    messages, rehydration_info = await _rehydrate_openai_messages_if_needed(
         db,
         session_id_int if session_id_int else None,
         account_id,
@@ -596,7 +644,6 @@ async def proxy_chat_completions(
     created = int(time.time())
 
     if has_client_tools:
-        # OpenCode mode: parse <tool_use> XML into proper OpenAI tool_calls
         if client_wants_stream:
             return _stream_gumloop_toolaware(
                 gummie_id, messages, auth, turnstile, raw_model,
@@ -604,15 +651,18 @@ async def proxy_chat_completions(
                 interaction_id=interaction_id,
                 account_id=account.get("id", 0),
                 account_email=account.get("email", "?"),
+                chat_session_id=session_id_int,
+                rehydration_info=rehydration_info,
             ), 0.0
         else:
             return await _accumulate_gumloop_toolaware(
                 gummie_id, messages, auth, turnstile, raw_model,
                 stream_id, created, proxy_url,
                 interaction_id=interaction_id,
+                chat_session_id=session_id_int,
+                account_id=account.get("id", 0),
             )
 
-    # Legacy MCP mode: stream everything as text
     if client_wants_stream:
         return _stream_gumloop(
             gummie_id, messages, auth, turnstile, gl_model, raw_model,
@@ -620,12 +670,16 @@ async def proxy_chat_completions(
             interaction_id=interaction_id,
             account_id=account.get("id", 0),
             account_email=account.get("email", "?"),
+            chat_session_id=session_id_int,
+            rehydration_info=rehydration_info,
         ), 0.0
     else:
         return await _accumulate_gumloop(
             gummie_id, messages, auth, turnstile, gl_model, raw_model,
             stream_id, created, proxy_url,
             interaction_id=interaction_id,
+            chat_session_id=session_id_int,
+            account_id=account.get("id", 0),
         )
 
 
@@ -641,6 +695,8 @@ def _stream_gumloop_toolaware(
     interaction_id: str | None = None,
     account_id: int = 0,
     account_email: str = "?",
+    chat_session_id: int = 0,
+    rehydration_info: dict | None = None,
 ) -> StreamingResponse:
     """Stream Gumloop response with proper OpenAI tool_calls parsing.
 
@@ -807,6 +863,13 @@ def _stream_gumloop_toolaware(
                     created=created,
                 ).encode()
 
+            if rehydration_info and rehydration_info.get("injected"):
+                mode = rehydration_info.get("mode", "delta")
+                count = rehydration_info.get("count", 0)
+                status_msg = f"\n\n_[Context synced: {count} messages injected ({mode})]_"
+                yield build_openai_chunk(stream_id, display_model, content=status_msg, created=created).encode()
+                full_text += status_msg
+
             finish_reason = "tool_calls" if tool_uses else "stop"
             yield build_openai_chunk(
                 stream_id, display_model,
@@ -819,6 +882,8 @@ def _stream_gumloop_toolaware(
             _stream_state["completion_tokens"] = usage["completion_tokens"]
             _stream_state["total_tokens"] = usage["total_tokens"]
             _stream_state["done"] = True
+
+            await _update_rehydration_watermark(chat_session_id, account_id)
 
         except Exception as e:
             log.error("Gumloop tool-aware streaming error: %s", e, exc_info=True)
@@ -847,6 +912,8 @@ async def _accumulate_gumloop_toolaware(
     created: int,
     proxy_url: str | None,
     interaction_id: str | None = None,
+    chat_session_id: int = 0,
+    account_id: int = 0,
 ) -> tuple[JSONResponse, float]:
     """Accumulate Gumloop response with proper tool_calls parsing."""
     try:
@@ -889,6 +956,7 @@ async def _accumulate_gumloop_toolaware(
             "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens},
         }
+        await _update_rehydration_watermark(chat_session_id, account_id)
         return JSONResponse(response, status_code=200), 0.0
 
     except Exception as e:
@@ -912,6 +980,8 @@ def _stream_gumloop(
     interaction_id: str | None = None,
     account_id: int = 0,
     account_email: str = "?",
+    chat_session_id: int = 0,
+    rehydration_info: dict | None = None,
 ) -> StreamingResponse:
     """Stream Gumloop response as OpenAI SSE chunks.
 
@@ -1085,6 +1155,11 @@ def _stream_gumloop(
                         continue
 
                     # Final finish — close the stream
+                    if rehydration_info and rehydration_info.get("injected"):
+                        mode = rehydration_info.get("mode", "delta")
+                        count = rehydration_info.get("count", 0)
+                        yield emit_text(f"\n\n_[Context synced: {count} messages injected ({mode})]_")
+
                     yield build_openai_chunk(
                         stream_id, display_model,
                         finish_reason="stop", created=created,
@@ -1097,6 +1172,7 @@ def _stream_gumloop(
                     yield build_openai_done().encode()
                     _stream_state["content"] = full_text
                     _stream_state["done"] = True
+                    await _update_rehydration_watermark(chat_session_id, account_id)
                     break
 
                 # Ignore other events (step-start, keepalive, interaction-name-update, etc.)
@@ -1133,6 +1209,8 @@ async def _accumulate_gumloop(
     created: int,
     proxy_url: str | None,
     interaction_id: str | None = None,
+    chat_session_id: int = 0,
+    account_id: int = 0,
 ) -> tuple[JSONResponse, float]:
     """Accumulate Gumloop response into OpenAI chat.completion JSON."""
     try:
@@ -1178,6 +1256,7 @@ async def _accumulate_gumloop(
                 "total_tokens": total_tokens,
             },
         }
+        await _update_rehydration_watermark(chat_session_id, account_id)
         return JSONResponse(response, status_code=200), 0.0
 
     except Exception as e:
