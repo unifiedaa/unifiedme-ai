@@ -140,14 +140,17 @@ def _openai_tools_to_gumloop(tools: list[dict]) -> list[dict]:
 
 def _tool_uses_to_openai(tool_uses: list[dict]) -> list[dict]:
     """Convert parsed tool_use blocks to OpenAI tool_calls format."""
+    from .gumloop.tool_converter import fix_tool_args
     result = []
     for item in tool_uses:
+        name = item.get("name", "")
+        args = fix_tool_args(name, item.get("input", {}))
         result.append({
             "id": item.get("id", f"call_{uuid.uuid4().hex[:24]}"),
             "type": "function",
             "function": {
-                "name": item.get("name", ""),
-                "arguments": json.dumps(item.get("input", {}), ensure_ascii=False),
+                "name": name,
+                "arguments": json.dumps(args, ensure_ascii=False),
             },
         })
     return result

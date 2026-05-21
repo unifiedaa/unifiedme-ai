@@ -378,3 +378,26 @@ def detect_tool_loop(messages: List[Dict[str, Any]], threshold: int = 3) -> Opti
         return f"Detected duplicate tool_results: {duplicate_results[:3]}. This may cause infinite loops."
 
     return None
+
+
+_TOOL_ARG_FIXES: Dict[str, Dict[str, str]] = {
+    "read": {"path": "filePath", "file": "filePath", "file_path": "filePath"},
+    "write": {"path": "filePath", "file": "filePath", "file_path": "filePath"},
+    "edit": {"path": "filePath", "file": "filePath", "file_path": "filePath"},
+    "glob": {"dir": "path", "directory": "path"},
+    "grep": {"dir": "path", "directory": "path", "regex": "pattern"},
+    "bash": {"cmd": "command", "shell": "command"},
+    "lsp_diagnostics": {"path": "filePath", "file": "filePath"},
+    "lsp_symbols": {"path": "filePath", "file": "filePath"},
+}
+
+
+def fix_tool_args(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize tool call arguments for known model mistakes."""
+    fixes = _TOOL_ARG_FIXES.get(name)
+    if not fixes or not isinstance(args, dict):
+        return args
+    for wrong_key, correct_key in fixes.items():
+        if wrong_key in args and correct_key not in args:
+            args[correct_key] = args.pop(wrong_key)
+    return args

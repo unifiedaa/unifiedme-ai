@@ -114,10 +114,12 @@ _TOOL_ROOT_KEY: dict[str, str] = {
 
 
 def _tool_uses_to_openai(tool_uses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    from .gumloop.tool_converter import fix_tool_args
     result = []
     for item in tool_uses:
         name = item.get("name", "")
         args = item.get("input", {})
+        args = fix_tool_args(name, args)
         root_key = _TOOL_ROOT_KEY.get(name)
         if root_key and isinstance(args, dict) and root_key not in args:
             args = {root_key: [args]}
