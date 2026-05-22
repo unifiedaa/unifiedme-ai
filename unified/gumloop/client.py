@@ -209,8 +209,16 @@ async def send_chat(
             if not got_turnstile_error:
                 return
             if turnstile:
-                turnstile._ready_token = None
-                turnstile._ready_at = 0
+                invalidate = getattr(turnstile, "invalidate", None)
+                if callable(invalidate):
+                    maybe_result = invalidate()
+                    if asyncio.iscoroutine(maybe_result):
+                        await maybe_result
+                else:
+                    if hasattr(turnstile, "_ready_token"):
+                        turnstile._ready_token = None
+                    if hasattr(turnstile, "_ready_at"):
+                        turnstile._ready_at = 0
             if attempt < MAX_TURNSTILE_RETRIES:
                 yield {
                     "type": "turnstile_retry",

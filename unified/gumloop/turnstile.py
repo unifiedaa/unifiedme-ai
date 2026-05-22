@@ -23,7 +23,7 @@ TURNSTILE_ACTION = "websocket_connect"
 TOKEN_TTL = 250
 MAX_SOLVE_ATTEMPTS = 3
 SOLVE_RETRY_DELAY = 5
-POOL_SIZE = max(1, int(os.getenv("GL_TURNSTILE_POOL_SIZE", "1")))
+POOL_SIZE = max(5, int(os.getenv("GL_TURNSTILE_POOL_SIZE", "5")))
 
 
 class TurnstileSolver:
