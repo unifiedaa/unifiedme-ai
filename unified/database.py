@@ -1613,12 +1613,19 @@ async def get_or_create_chat_session_for_opencode_session(
         return int(existing["id"])
 
     conn = await get_db()
-    cur = await conn.execute(
-        "INSERT INTO chat_sessions (title, model, opencode_session_key) VALUES (?, ?, ?)",
-        (title, model, opencode_session_key),
-    )
-    await conn.commit()
-    return cur.lastrowid
+    try:
+        cur = await conn.execute(
+            "INSERT INTO chat_sessions (title, model, opencode_session_key) VALUES (?, ?, ?)",
+            (title, model, opencode_session_key),
+        )
+        await conn.commit()
+        return cur.lastrowid
+    except Exception:
+        await conn.rollback()
+        existing = await get_chat_session_by_opencode_session_key(opencode_session_key)
+        if existing:
+            return int(existing["id"])
+        raise
 
 
 async def get_chat_session_by_api_key_id(api_key_id: int) -> Optional[dict]:
@@ -1967,10 +1974,24 @@ async def delete_chat_session(session_id: int) -> bool:
 
 async def add_chat_message(session_id: int, role: str, content: str, model: str = "", opencode_message_id: str = "") -> int:
     conn = await get_db()
-    cur = await conn.execute(
-        "INSERT INTO chat_messages (session_id, opencode_message_id, role, content, model) VALUES (?, ?, ?, ?, ?)",
-        (session_id, opencode_message_id, role, content, model),
-    )
+    if opencode_message_id:
+        cur = await conn.execute(
+            "INSERT OR IGNORE INTO chat_messages (session_id, opencode_message_id, role, content, model) VALUES (?, ?, ?, ?, ?)",
+            (session_id, opencode_message_id, role, content, model),
+        )
+        if cur.rowcount == 0:
+            existing = await get_chat_message_by_opencode_message_id(session_id, opencode_message_id)
+            if existing:
+                await conn.execute(
+                    "UPDATE chat_sessions SET updated_at = datetime('now') WHERE id = ?", (session_id,),
+                )
+                await conn.commit()
+                return int(existing["id"])
+    else:
+        cur = await conn.execute(
+            "INSERT INTO chat_messages (session_id, opencode_message_id, role, content, model) VALUES (?, ?, ?, ?, ?)",
+            (session_id, opencode_message_id, role, content, model),
+        )
     await conn.execute(
         "UPDATE chat_sessions SET updated_at = datetime('now') WHERE id = ?", (session_id,),
     )

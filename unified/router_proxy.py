@@ -542,6 +542,9 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
                             "prompt_tokens": gl_stream_state["prompt_tokens"],
                             "completion_tokens": gl_stream_state["completion_tokens"],
                             "total_tokens": gl_stream_state["total_tokens"],
+                            "cached_tokens": gl_stream_state.get("cached_tokens", 0),
+                            "uncached_prompt_tokens": max(gl_stream_state["prompt_tokens"] - gl_stream_state.get("cached_tokens", 0), 0),
+                            "credit": gl_stream_state.get("credits", 0),
                         },
                         "error": stream_error or None,
                     }, ensure_ascii=False)

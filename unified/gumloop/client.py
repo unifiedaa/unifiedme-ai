@@ -181,6 +181,10 @@ async def upload_file(
     }
 
 
+TURNSTILE_FAILED_ERRORS = ("turnstile_verification_failed", "captcha_verification_failed", "captcha_failed")
+MAX_TURNSTILE_RETRIES = 3
+
+
 async def send_chat(
     gummie_id: str,
     messages: list[dict[str, Any]],
@@ -191,10 +195,36 @@ async def send_chat(
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Send chat message via WebSocket and yield response events."""
     async with _chat_semaphore:
-        async for event in _send_chat_inner(
-            gummie_id, messages, auth, turnstile, interaction_id, proxy_url
-        ):
-            yield event
+        for attempt in range(1, MAX_TURNSTILE_RETRIES + 1):
+            got_turnstile_error = False
+            async for event in _send_chat_inner(
+                gummie_id, messages, auth, turnstile, interaction_id, proxy_url
+            ):
+                if event.get("type") == "error":
+                    err_msg = str(event.get("error", ""))
+                    if any(keyword in err_msg.lower() for keyword in TURNSTILE_FAILED_ERRORS):
+                        got_turnstile_error = True
+                        break
+                yield event
+            if not got_turnstile_error:
+                return
+            if turnstile:
+                turnstile._ready_token = None
+                turnstile._ready_at = 0
+            if attempt < MAX_TURNSTILE_RETRIES:
+                yield {
+                    "type": "turnstile_retry",
+                    "attempt": attempt,
+                    "max": MAX_TURNSTILE_RETRIES,
+                    "retry_after": 2,
+                    "error": "turnstile_verification_failed",
+                }
+                await asyncio.sleep(2)
+            else:
+                yield {
+                    "type": "error",
+                    "error": f"turnstile_verification_failed (failed {MAX_TURNSTILE_RETRIES} attempts)",
+                }
 
 
 async def _send_chat_inner(
@@ -210,7 +240,6 @@ async def _send_chat_inner(
     if not interaction_id:
         interaction_id = str(uuid.uuid4()).replace("-", "")[:22]
 
-    # Solve Turnstile captcha
     turnstile_token = None
     if turnstile:
         turnstile_token = await turnstile.get_token()

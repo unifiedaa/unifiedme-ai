@@ -67,11 +67,13 @@ async def _ensure_turnstile_key() -> None:
     """Load captcha API key from DB settings if not already set."""
     ts = _get_turnstile()
     if ts._api_key:
+        ts.start_pool()
         return
     from . import database as db
     key = await db.get_setting("captcha_api_key", "")
     if key:
         ts.update_api_key(key)
+        ts.start_pool()
 
 
 def _get_auth(account: dict) -> GumloopAuth:
@@ -385,6 +387,10 @@ async def _rehydrate_openai_messages_if_needed(db, chat_session_id: int | None, 
 
     if not chat_session_id or not account_id:
         log.info("[REHYDRATE] skip: no session or account (session=%s account=%s)", chat_session_id, account_id)
+        return no_inject
+
+    if current_messages and current_messages[-1].get("role") == "tool":
+        log.debug("[REHYDRATE] skip: tool continuation (session=%s)", chat_session_id)
         return no_inject
 
     binding = await db.get_gumloop_binding_full(chat_session_id, account_id)
@@ -886,9 +892,11 @@ def _stream_gumloop_toolaware(
                 # --- Finish ---
                 elif etype == "finish":
                     event_usage = event.get("usage") or {}
-                    usage["prompt_tokens"] += event_usage.get("input_tokens", 0)
-                    usage["completion_tokens"] += event_usage.get("output_tokens", 0)
-                    usage["total_tokens"] += event_usage.get("total_tokens", 0)
+                    usage["prompt_tokens"] = event_usage.get("input_tokens", 0)
+                    usage["completion_tokens"] = event_usage.get("output_tokens", 0)
+                    usage["total_tokens"] = event_usage.get("total_tokens", 0)
+                    usage["cached_tokens"] = event_usage.get("cache_read_input_tokens", event_usage.get("cached_tokens", 0))
+                    usage["credits"] = event.get("credits") or 0
                     if not event.get("final", True):
                         yield build_openai_chunk(
                             stream_id, display_model,
@@ -900,6 +908,14 @@ def _stream_gumloop_toolaware(
                 # --- Keepalive ---
                 elif etype == "keepalive":
                     yield b": keepalive\n\n"
+                elif etype == "turnstile_retry":
+                    attempt = event.get("attempt", 1)
+                    max_attempts = event.get("max", 3)
+                    retry_msg = f"\n\n⚠️ _Turnstile verification failed (attempt {attempt}/{max_attempts}). Retrying with fresh token..._\n\n"
+                    full_text += retry_msg
+                    yield build_openai_chunk(
+                        stream_id, display_model, content=retry_msg, created=created,
+                    ).encode()
 
             # Parse remaining buffered text for tool_use blocks
             unstreamed = full_text[streamed_pos:]
@@ -983,9 +999,9 @@ async def _accumulate_gumloop_toolaware(
                 full_text += event.get("delta", "")
             elif etype == "finish":
                 event_usage = event.get("usage") or {}
-                prompt_tokens += event_usage.get("input_tokens", 0)
-                completion_tokens += event_usage.get("output_tokens", 0)
-                total_tokens += event_usage.get("total_tokens", 0)
+                prompt_tokens = event_usage.get("input_tokens", 0)
+                completion_tokens = event_usage.get("output_tokens", 0)
+                total_tokens = event_usage.get("total_tokens", 0)
                 if event.get("final", True):
                     break
             elif etype == "error":
@@ -1197,9 +1213,11 @@ def _stream_gumloop(
                 elif etype == "finish":
                     is_final = event.get("final", True)
                     usage = event.get("usage") or {}
-                    _stream_state["prompt_tokens"] += usage.get("input_tokens", 0)
-                    _stream_state["completion_tokens"] += usage.get("output_tokens", 0)
-                    _stream_state["total_tokens"] += usage.get("total_tokens", 0)
+                    _stream_state["prompt_tokens"] = usage.get("input_tokens", 0)
+                    _stream_state["completion_tokens"] = usage.get("output_tokens", 0)
+                    _stream_state["total_tokens"] = usage.get("total_tokens", 0)
+                    _stream_state["cached_tokens"] = usage.get("cache_read_input_tokens", usage.get("cached_tokens", 0))
+                    _stream_state["credits"] = event.get("credits") or 0
 
                     if not is_final:
                         # Multi-step: agent is executing tools, more coming
@@ -1287,9 +1305,9 @@ async def _accumulate_gumloop(
 
             elif etype == "finish":
                 usage = event.get("usage") or {}
-                prompt_tokens += usage.get("input_tokens", 0)
-                completion_tokens += usage.get("output_tokens", 0)
-                total_tokens += usage.get("total_tokens", 0)
+                prompt_tokens = usage.get("input_tokens", 0)
+                completion_tokens = usage.get("output_tokens", 0)
+                total_tokens = usage.get("total_tokens", 0)
                 if event.get("final", True):
                     break
 

@@ -4318,7 +4318,7 @@ function showLogModal(idx) {
       promptTokens = u.prompt_tokens || 0;
       completionTokens = u.completion_tokens || 0;
       totalTokens = u.total_tokens || 0;
-      credit = u.credit || u.cost || 0;
+      credit = u.credit || u.credits || u.cost || 0;
     }
   } catch(e) {
     // If JSON parse fails, try regex extraction from raw text
@@ -4327,7 +4327,7 @@ function showLogModal(idx) {
       const ptMatch = raw.match(/"prompt_tokens":\s*(\d+)/);
       const ctMatch = raw.match(/"completion_tokens":\s*(\d+)/);
       const ttMatch = raw.match(/"total_tokens":\s*(\d+)/);
-      const crMatch = raw.match(/"credit":\s*([\d.]+)/) || raw.match(/"cost":\s*([\d.]+)/);
+      const crMatch = raw.match(/"credit":\s*([\d.]+)/) || raw.match(/"credits":\s*([\d.]+)/) || raw.match(/"cost":\s*([\d.]+)/);
       if (ptMatch) promptTokens = parseInt(ptMatch[1]);
       if (ctMatch) completionTokens = parseInt(ctMatch[1]);
       if (ttMatch) totalTokens = parseInt(ttMatch[1]);
