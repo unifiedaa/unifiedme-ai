@@ -62,6 +62,7 @@ _GL2_EXPERIMENT_PRUNE_TOOLS_ENV = "UNIFIED_GL2_EXPERIMENT_PRUNE_TOOLS"
 _GL2_EXPERIMENT_CACHE_CONFIG_ENV = "UNIFIED_GL2_EXPERIMENT_CACHE_CONFIG"
 _GL2_WS_OPEN_TIMEOUT_ENV = "UNIFIED_GL2_WS_OPEN_TIMEOUT"
 _GL2_WS_HANDSHAKE_RETRIES_ENV = "UNIFIED_GL2_WS_HANDSHAKE_RETRIES"
+_GL2_DEBUG_PROMPT_BREAKDOWN_ENV = "UNIFIED_GL2_DEBUG_PROMPT_BREAKDOWN"
 _GL2_TOOL_ALLOWLIST = {
     "read", "write", "edit", "grep", "glob", "bash", "todowrite", "question",
     "read_many", "list", "task", "fetch", "webfetch", "lsp_diagnostics",
@@ -83,6 +84,10 @@ def _build_gl2_config_fingerprint(system_prompt: str, tools: list[dict[str, Any]
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _chars_json(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False))
 
 def _map_gl2_model(model: str) -> str:
     bare = model.removeprefix("gl2-")
@@ -359,12 +364,32 @@ async def proxy_chat_completions(
 
     # Build combined system prompt: LLM-only override + original system + tool definitions
     combined_system = system_prompt or ""
+    tool_prompt = ""
     if has_client_tools and gumloop_tools:
         tool_prompt = tools_to_system_prompt(gumloop_tools)
         combined_system = (combined_system + "\n\n" + tool_prompt) if combined_system else tool_prompt
     # Prepend aggressive override to prevent Gumloop from using platform tools
     if has_client_tools:
         combined_system = LLM_ONLY_OVERRIDE + "\n\n" + combined_system
+
+    if _env_flag(_GL2_DEBUG_PROMPT_BREAKDOWN_ENV):
+        raw_messages = body.get("messages", [])
+        log.info(
+            "[GL2_PROMPT_BREAKDOWN] model=%s raw_messages_chars=%s rehydrated_messages_chars=%s converted_messages_chars=%s rehydration_added_chars=%s system_prompt_chars=%s llm_override_chars=%s tool_prompt_chars=%s combined_system_chars=%s tools_count=%s rehydration_injected=%s rehydration_mode=%s rehydration_count=%s",
+            raw_model,
+            _chars_json(raw_messages),
+            _chars_json(messages),
+            _chars_json(converted_messages),
+            max(_chars_json(messages) - _chars_json(raw_messages), 0),
+            len(system_prompt or ""),
+            len(LLM_ONLY_OVERRIDE) if has_client_tools else 0,
+            len(tool_prompt),
+            len(combined_system or ""),
+            len(gumloop_tools),
+            bool(rehydration_info.get("injected")) if rehydration_info else False,
+            rehydration_info.get("mode") if rehydration_info else "none",
+            rehydration_info.get("count") if rehydration_info else 0,
+        )
 
     should_update_config = True
     config_fingerprint = _build_gl2_config_fingerprint(combined_system, config_tools, gl_model)

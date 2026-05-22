@@ -20,7 +20,7 @@ from .proxy_kiro import proxy_chat_completions as kiro_proxy, proxy_messages as 
 from .proxy_codebuddy import proxy_chat_completions as codebuddy_proxy, get_stream_data, get_stream_credit
 from .proxy_skillboss import proxy_chat_completions as skillboss_proxy
 from .proxy_wavespeed import proxy_chat_completions as wavespeed_proxy
-from .proxy_gumloop import proxy_chat_completions as gumloop_proxy, _update_rehydration_watermark
+from .proxy_gumloop import proxy_chat_completions as gumloop_proxy, _update_rehydration_watermark, sanitize_assistant_transcript
 from .proxy_gumloop_v2 import proxy_chat_completions as gumloop_v2_proxy
 from .proxy_windsurf import proxy_chat_completions as windsurf_proxy
 from .proxy_therouter import proxy_chat_completions as therouter_proxy
@@ -84,6 +84,7 @@ async def _persist_assistant_response(chat_session_id: int, response, model: str
             return
         data = json.loads(raw_body.decode('utf-8', errors='replace'))
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        content = sanitize_assistant_transcript(content)
         if not content:
             return
         prev = await db.get_last_chat_message(chat_session_id)
@@ -558,7 +559,7 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
                     if _chat_session_id and gl_stream_state.get("content"):
                         try:
                             prev = await db.get_last_chat_message(_chat_session_id)
-                            content = gl_stream_state["content"]
+                            content = sanitize_assistant_transcript(gl_stream_state["content"])
                             if not prev or prev.get("role") != "assistant" or prev.get("content") != content:
                                 await db.add_chat_message(_chat_session_id, "assistant", content, _model)
                             await _update_rehydration_watermark(_chat_session_id, _acct_id)
@@ -580,6 +581,7 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
                         raw_body = getattr(response, 'body', b'')
                         data = json.loads(raw_body.decode('utf-8', errors='replace')) if raw_body else {}
                         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        content = sanitize_assistant_transcript(content)
                         if content:
                             prev = await db.get_last_chat_message(chat_session_id)
                             if not prev or prev.get("role") != "assistant" or prev.get("content") != content:

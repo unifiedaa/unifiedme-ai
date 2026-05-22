@@ -16,6 +16,7 @@ import logging
 import os
 import time
 import uuid
+import re
 from typing import AsyncIterator
 
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -28,13 +29,21 @@ from .gumloop.client import (
     upload_file,
 )
 import base64
-import re
 import httpx as _httpx
 
 from .gumloop.parser import build_openai_chunk, build_openai_done, build_openai_tool_call_chunk
 from .gumloop.tool_converter import convert_messages_with_tools, parse_tool_calls
 
 log = logging.getLogger("unified.proxy_gumloop")
+
+_ASSISTANT_NOISE_PATTERNS = (
+    r"(?mis)^Thought:.*?(?=\n\s*\n|\Z)",
+    r"(?mis)^_Preparing tool call\.\.\._\s*",
+    r"(?mis)^_\[Context synced:.*?\]_\s*",
+    r"(?mis)^Preparing tool call\.\.\.\s*",
+    r"(?mis)^Context synced:.*$",
+    r"(?mis)^(?:Actually,|Let me|I should|Mari saya|Saya akan)\b.*?(?=\n\s*\n|\Z)",
+)
 
 _EXPERIMENT_COMPACT_HISTORY_ENV = "UNIFIED_GL_EXPERIMENT_COMPACT_HISTORY"
 _EXPERIMENT_TRIM_TOOL_RESULTS_ENV = "UNIFIED_GL_EXPERIMENT_TRIM_TOOL_RESULTS"
@@ -356,6 +365,17 @@ def _message_text_for_overlap(content) -> str:
     return str(content or "")
 
 
+def sanitize_assistant_transcript(content: str) -> str:
+    text = content if isinstance(content, str) else str(content or "")
+    if not text:
+        return ""
+    text = re.sub(r"<thinking>\n?.*?</thinking>\n?", "", text, flags=re.DOTALL)
+    for pattern in _ASSISTANT_NOISE_PATTERNS:
+        text = re.sub(pattern, "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def _persisted_rows_to_openai_messages(rows: list[dict]) -> list[dict]:
     result = []
     for row in rows:
@@ -410,6 +430,8 @@ def _render_delta_context(messages: list[dict]) -> str:
     for msg in messages:
         role = str(msg.get("role", "")).strip().upper() or "USER"
         content = _message_text_for_overlap(msg.get("content", ""))
+        if str(msg.get("role", "")) == "assistant":
+            content = sanitize_assistant_transcript(content)
         content = _trim_old_tool_result_text(content)
         if not content:
             continue
@@ -432,11 +454,25 @@ def _build_summary_recent_context(summary_text: str, recent_messages: list[dict]
         for msg in recent_messages:
             role = str(msg.get("role", "")).upper()
             content = _message_text_for_overlap(msg.get("content", ""))
+            if str(msg.get("role", "")) == "assistant":
+                content = sanitize_assistant_transcript(content)
             content = _trim_old_tool_result_text(content)
             if content:
                 lines.append(f"{role}: {content}")
         lines.append("</recent_messages>")
     return "\n".join(lines)
+
+
+def _count_meaningful_rehydration_messages(messages: list[dict]) -> int:
+    count = 0
+    for msg in messages:
+        content = _message_text_for_overlap(msg.get("content", ""))
+        if str(msg.get("role", "")) == "assistant":
+            content = sanitize_assistant_transcript(content)
+        content = _trim_old_tool_result_text(content)
+        if content:
+            count += 1
+    return count
 
 
 async def _rehydrate_openai_messages_if_needed(db, chat_session_id: int | None, account_id: int, current_messages: list[dict]) -> tuple[list[dict], dict]:
@@ -476,9 +512,20 @@ async def _rehydrate_openai_messages_if_needed(db, chat_session_id: int | None, 
             log.info("[REHYDRATE] same-account delta rows empty after filter: session=%s", chat_session_id)
             return no_inject
 
+        meaningful_delta_count = _count_meaningful_rehydration_messages(delta_messages)
+        if meaningful_delta_count <= 0:
+            log.info(
+                "[REHYDRATE] same-account delta skipped after sanitize: session=%s account=%s watermark=%s raw_count=%s",
+                chat_session_id,
+                account_id,
+                watermark,
+                len(delta_messages),
+            )
+            return no_inject
+
         context_message = {"role": "system", "content": _render_delta_context(delta_messages)}
-        log.info("[REHYDRATE] same-account delta inject: session=%s account=%s watermark=%s count=%s", chat_session_id, account_id, watermark, len(delta_messages))
-        return [context_message, *current_messages], {"injected": True, "count": len(delta_messages), "mode": "delta"}
+        log.info("[REHYDRATE] same-account delta inject: session=%s account=%s watermark=%s raw_count=%s meaningful_count=%s", chat_session_id, account_id, watermark, len(delta_messages), meaningful_delta_count)
+        return [context_message, *current_messages], {"injected": True, "count": meaningful_delta_count, "mode": "delta"}
 
     # --- First bind of a different account to this session ---
     # Use summary + bounded recent window instead of full raw history
@@ -519,11 +566,12 @@ async def _rehydrate_openai_messages_if_needed(db, chat_session_id: int | None, 
         recent_rows = await db.get_session_messages_after(chat_session_id, max(0, latest_id - recent_window))
 
     recent_messages = _persisted_rows_to_openai_messages(recent_rows) if recent_rows else []
+    meaningful_recent_count = _count_meaningful_rehydration_messages(recent_messages)
 
     context_message = {"role": "system", "content": _build_summary_recent_context(summary_text, recent_messages)}
-    inject_count = len(recent_messages) + 1
-    log.info("[REHYDRATE] first-bind summary+recent inject: session=%s account=%s summary_len=%s recent=%s total_stored=%s compact=%s trim_tools=%s",
-             chat_session_id, account_id, len(summary_text), len(recent_messages), total_count, compact_history, _experiment_trim_tool_results_enabled())
+    inject_count = meaningful_recent_count + (1 if summary_text else 0)
+    log.info("[REHYDRATE] first-bind summary+recent inject: session=%s account=%s summary_len=%s recent_raw=%s recent_meaningful=%s total_stored=%s compact=%s trim_tools=%s",
+             chat_session_id, account_id, len(summary_text), len(recent_messages), meaningful_recent_count, total_count, compact_history, _experiment_trim_tool_results_enabled())
     return [context_message, *current_messages], {"injected": True, "count": inject_count, "mode": "summary_delta"}
 
 
