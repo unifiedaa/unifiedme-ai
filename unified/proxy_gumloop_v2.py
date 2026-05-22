@@ -367,6 +367,9 @@ def _stream_gumloop_v2(
         "prompt_tokens": 0,
         "completion_tokens": 0,
         "total_tokens": 0,
+        "cached_tokens": 0,
+        "uncached_prompt_tokens": 0,
+        "credits": 0,
         "done": False,
         "_account_id": account_id,
         "_account_email": account_email,
@@ -377,7 +380,14 @@ def _stream_gumloop_v2(
             full_text = ""
             streamed_pos = 0
             in_thinking = False
-            usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            usage = {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "cached_tokens": 0,
+                "uncached_prompt_tokens": 0,
+                "credits": 0,
+            }
             buffering_notified = False
 
             yield build_openai_chunk(stream_id, display_model, role="assistant", created=created).encode()
@@ -512,6 +522,12 @@ def _stream_gumloop_v2(
                     usage["prompt_tokens"] += event_usage.get("input_tokens", 0)
                     usage["completion_tokens"] += event_usage.get("output_tokens", 0)
                     usage["total_tokens"] += event_usage.get("total_tokens", 0)
+                    usage["cached_tokens"] += event_usage.get("cached_tokens", 0)
+                    usage["uncached_prompt_tokens"] += event_usage.get(
+                        "uncached_prompt_tokens",
+                        event_usage.get("cache_creation_input_tokens", 0),
+                    )
+                    usage["credits"] += event.get("credits", 0) or 0
                     if not event.get("final", True):
                         continue
                     break
@@ -553,6 +569,9 @@ def _stream_gumloop_v2(
             _stream_state["prompt_tokens"] = usage["prompt_tokens"]
             _stream_state["completion_tokens"] = usage["completion_tokens"]
             _stream_state["total_tokens"] = usage["total_tokens"]
+            _stream_state["cached_tokens"] = usage["cached_tokens"]
+            _stream_state["uncached_prompt_tokens"] = usage["uncached_prompt_tokens"]
+            _stream_state["credits"] = usage["credits"]
             _stream_state["done"] = True
 
         except Exception as e:
@@ -592,6 +611,9 @@ async def _accumulate_gumloop_v2(
         prompt_tokens = 0
         completion_tokens = 0
         total_tokens = 0
+        cached_tokens = 0
+        uncached_prompt_tokens = 0
+        credits = 0
         async for event in send_chat(gummie_id, messages, auth, turnstile, interaction_id=interaction_id, proxy_url=proxy_url):
             etype = event.get("type", "")
             if etype == "text-delta":
@@ -601,6 +623,12 @@ async def _accumulate_gumloop_v2(
                 prompt_tokens += event_usage.get("input_tokens", 0)
                 completion_tokens += event_usage.get("output_tokens", 0)
                 total_tokens += event_usage.get("total_tokens", 0)
+                cached_tokens += event_usage.get("cached_tokens", 0)
+                uncached_prompt_tokens += event_usage.get(
+                    "uncached_prompt_tokens",
+                    event_usage.get("cache_creation_input_tokens", 0),
+                )
+                credits += event.get("credits", 0) or 0
                 if event.get("final", True):
                     break
             elif etype == "error":
@@ -623,7 +651,14 @@ async def _accumulate_gumloop_v2(
             "created": created,
             "model": display_model,
             "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens},
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+                "cached_tokens": cached_tokens,
+                "uncached_prompt_tokens": uncached_prompt_tokens,
+                "credits": credits,
+            },
         }
         return JSONResponse(response, status_code=200), 0.0
     except Exception as e:
