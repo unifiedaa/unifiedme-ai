@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -38,6 +40,13 @@ Format:
 <input>{"param": "value"}</input>
 </tool_use>
 
+CRITICAL OUTPUT RULES:
+- If the next action is a tool call, output ONLY one or more <tool_use> blocks.
+- Do NOT output thoughts, explanations, markdown, preambles, planning text, or code fences before tool calls.
+- Do NOT say what tool you will use. Just emit the <tool_use> XML immediately.
+- Do NOT print tool arguments outside the <input> JSON.
+- For direct file reads like "read file X", your entire response must be a single <tool_use> block for read.
+
 The proxy converts this XML into OpenAI tool_calls executed locally on the user's machine.
 </CRITICAL_INSTRUCTION>
 """
@@ -47,6 +56,33 @@ The proxy converts this XML into OpenAI tool_calls executed locally on the user'
 _GL2_MODEL_ALIASES = {
     "kimi-k2.6": "moonshotai/kimi-k2.6",
 }
+
+_GL2_EXPERIMENT_STABLE_TOOLS_ENV = "UNIFIED_GL2_EXPERIMENT_STABLE_TOOLS"
+_GL2_EXPERIMENT_PRUNE_TOOLS_ENV = "UNIFIED_GL2_EXPERIMENT_PRUNE_TOOLS"
+_GL2_EXPERIMENT_CACHE_CONFIG_ENV = "UNIFIED_GL2_EXPERIMENT_CACHE_CONFIG"
+_GL2_WS_OPEN_TIMEOUT_ENV = "UNIFIED_GL2_WS_OPEN_TIMEOUT"
+_GL2_WS_HANDSHAKE_RETRIES_ENV = "UNIFIED_GL2_WS_HANDSHAKE_RETRIES"
+_GL2_TOOL_ALLOWLIST = {
+    "read", "write", "edit", "grep", "glob", "bash", "todowrite", "question",
+    "read_many", "list", "task", "fetch", "webfetch", "lsp_diagnostics",
+    "lsp_find_references", "lsp_goto_definition", "lsp_rename", "lsp_symbols",
+    "apply_patch",
+}
+_gl2_config_cache: dict[str, str] = {}
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _build_gl2_config_fingerprint(system_prompt: str, tools: list[dict[str, Any]] | None, model_name: str) -> str:
+    payload = {
+        "system_prompt": system_prompt,
+        "tools": tools or [],
+        "model_name": model_name,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 def _map_gl2_model(model: str) -> str:
     bare = model.removeprefix("gl2-")
@@ -107,10 +143,71 @@ def _filter_duplicate_mcp_tools(tools: list[dict[str, Any]]) -> list[dict[str, A
     ]
 
 
+def _normalize_gl2_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Optional gl2 experiment: keep tool prompt stable/cache-friendly."""
+    if not (_env_flag(_GL2_EXPERIMENT_STABLE_TOOLS_ENV) or _env_flag(_GL2_EXPERIMENT_PRUNE_TOOLS_ENV)):
+        return tools
+
+    prune = _env_flag(_GL2_EXPERIMENT_PRUNE_TOOLS_ENV)
+    seen: set[str] = set()
+    normalized: list[dict[str, Any]] = []
+    for tool in sorted(tools, key=lambda t: str(t.get("name", ""))):
+        name = str(tool.get("name", ""))
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        if prune and name not in _GL2_TOOL_ALLOWLIST:
+            continue
+        normalized.append(tool)
+    return normalized
+
+
 _TOOL_ROOT_KEY: dict[str, str] = {
     "question": "questions",
     "todowrite": "todos",
 }
+
+
+def _remap_gl2_remote_tool(name: str, args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    if name == "sandbox_file":
+        action = str(args.get("action", "")).lower()
+        mapped = {
+            "read": "read",
+            "write": "write",
+            "edit": "edit",
+        }.get(action)
+        if mapped:
+            cleaned = dict(args)
+            cleaned.pop("action", None)
+            cleaned.pop("content", None)
+            cleaned.pop("old_string", None)
+            cleaned.pop("new_string", None)
+            cleaned.pop("replace_all", None)
+            if mapped == "write" and "content" in args and "content" not in cleaned:
+                cleaned["content"] = args.get("content")
+            if mapped == "edit":
+                if "old_string" in args:
+                    cleaned["oldString"] = args.get("old_string")
+                if "new_string" in args:
+                    cleaned["newString"] = args.get("new_string")
+                if "replace_all" in args:
+                    cleaned["replaceAll"] = args.get("replace_all")
+            return mapped, cleaned
+    if name == "sandbox_shell":
+        cleaned = dict(args)
+        cleaned.pop("action", None)
+        if "command" not in cleaned and "cmd" in cleaned:
+            cleaned["command"] = cleaned.pop("cmd")
+        return "bash", cleaned
+    if name == "sandbox_match":
+        action = str(args.get("action", "")).lower()
+        cleaned = dict(args)
+        cleaned.pop("action", None)
+        if action == "grep":
+            return "grep", cleaned
+        if action == "glob":
+            return "glob", cleaned
+    return name, args
 
 
 def _tool_uses_to_openai(tool_uses: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -119,6 +216,8 @@ def _tool_uses_to_openai(tool_uses: list[dict[str, Any]]) -> list[dict[str, Any]
     for item in tool_uses:
         name = item.get("name", "")
         args = item.get("input", {})
+        if isinstance(args, dict):
+            name, args = _remap_gl2_remote_tool(name, args)
         args = fix_tool_args(name, args)
         root_key = _TOOL_ROOT_KEY.get(name)
         if root_key and isinstance(args, dict) and root_key not in args:
@@ -205,6 +304,14 @@ async def proxy_chat_completions(
     # In pure-LLM mode, the LLM should use standard tool names (read, grep, bash)
     # instead of MCP variants (cloudflare-mcp_read_file, cloudflare-mcp_bash).
     gumloop_tools = _filter_duplicate_mcp_tools(gumloop_tools)
+    gumloop_tools = _normalize_gl2_tools(gumloop_tools)
+    if _env_flag(_GL2_EXPERIMENT_STABLE_TOOLS_ENV) or _env_flag(_GL2_EXPERIMENT_PRUNE_TOOLS_ENV):
+        log.info(
+            "[GL2_TOOLS] normalized tools: sent=%s stable=%s prune=%s",
+            len(gumloop_tools),
+            _env_flag(_GL2_EXPERIMENT_STABLE_TOOLS_ENV),
+            _env_flag(_GL2_EXPERIMENT_PRUNE_TOOLS_ENV),
+        )
     # History-only conversion: convert tool_use/tool_result blocks to plain text
     # Tool definitions go in system_prompt via update_gummie_config, NOT in messages
     converted_messages = convert_messages_with_tools(messages)
@@ -259,15 +366,26 @@ async def proxy_chat_completions(
     if has_client_tools:
         combined_system = LLM_ONLY_OVERRIDE + "\n\n" + combined_system
 
+    should_update_config = True
+    config_fingerprint = _build_gl2_config_fingerprint(combined_system, config_tools, gl_model)
+    if _env_flag(_GL2_EXPERIMENT_CACHE_CONFIG_ENV):
+        cached_fingerprint = _gl2_config_cache.get(gummie_id)
+        if cached_fingerprint == config_fingerprint:
+            should_update_config = False
+            log.info("[GL2_CONFIG] Skip update_gummie_config fingerprint hit gummie=%s", gummie_id)
+
     try:
-        await update_gummie_config(
-            gummie_id=gummie_id,
-            auth=auth,
-            system_prompt=combined_system or None,
-            tools=config_tools,
-            model_name=gl_model,
-            proxy_url=proxy_url,
-        )
+        if should_update_config:
+            await update_gummie_config(
+                gummie_id=gummie_id,
+                auth=auth,
+                system_prompt=combined_system or None,
+                tools=config_tools,
+                model_name=gl_model,
+                proxy_url=proxy_url,
+            )
+            if _env_flag(_GL2_EXPERIMENT_CACHE_CONFIG_ENV):
+                _gl2_config_cache[gummie_id] = config_fingerprint
     except Exception as e:
         log.warning("Failed to update Gumloop v2 gummie config: %s", e)
 
@@ -291,6 +409,8 @@ async def proxy_chat_completions(
             account_email=account.get("email", "?"),
             chat_session_id=session_id_int or None,
             rehydration_info=rehydration_info,
+            open_timeout=float(os.getenv(_GL2_WS_OPEN_TIMEOUT_ENV, os.getenv("GL_WS_OPEN_TIMEOUT", "30"))),
+            handshake_retries=int(os.getenv(_GL2_WS_HANDSHAKE_RETRIES_ENV, os.getenv("GL_WS_HANDSHAKE_RETRIES", "3"))),
         ), 0.0
 
     return await _accumulate_gumloop_v2(
@@ -305,6 +425,8 @@ async def proxy_chat_completions(
         proxy_url,
         chat_session_id=session_id_int or None,
         account_id=account_id,
+        open_timeout=float(os.getenv(_GL2_WS_OPEN_TIMEOUT_ENV, os.getenv("GL_WS_OPEN_TIMEOUT", "30"))),
+        handshake_retries=int(os.getenv(_GL2_WS_HANDSHAKE_RETRIES_ENV, os.getenv("GL_WS_HANDSHAKE_RETRIES", "3"))),
     )
 
 
@@ -360,6 +482,8 @@ def _stream_gumloop_v2(
     account_email: str = "?",
     chat_session_id: int | None = None,
     rehydration_info: dict[str, Any] | None = None,
+    open_timeout: float | None = None,
+    handshake_retries: int | None = None,
 ) -> StreamingResponse:
     _stream_state: dict[str, Any] = {
         "cost": 0.0,
@@ -392,7 +516,16 @@ def _stream_gumloop_v2(
 
             yield build_openai_chunk(stream_id, display_model, role="assistant", created=created).encode()
 
-            async for event in send_chat(gummie_id, messages, auth, turnstile, interaction_id=interaction_id, proxy_url=proxy_url):
+            async for event in send_chat(
+                gummie_id,
+                messages,
+                auth,
+                turnstile,
+                interaction_id=interaction_id,
+                proxy_url=proxy_url,
+                open_timeout=open_timeout,
+                handshake_retries=handshake_retries,
+            ):
                 etype = event.get("type", "")
                 if etype not in ("keepalive",):
                     if etype == "error":
@@ -605,6 +738,8 @@ async def _accumulate_gumloop_v2(
     proxy_url: str | None,
     chat_session_id: int | None = None,
     account_id: int = 0,
+    open_timeout: float | None = None,
+    handshake_retries: int | None = None,
 ) -> tuple[JSONResponse, float]:
     try:
         full_text = ""
@@ -614,7 +749,16 @@ async def _accumulate_gumloop_v2(
         cached_tokens = 0
         uncached_prompt_tokens = 0
         credits = 0
-        async for event in send_chat(gummie_id, messages, auth, turnstile, interaction_id=interaction_id, proxy_url=proxy_url):
+        async for event in send_chat(
+            gummie_id,
+            messages,
+            auth,
+            turnstile,
+            interaction_id=interaction_id,
+            proxy_url=proxy_url,
+            open_timeout=open_timeout,
+            handshake_retries=handshake_retries,
+        ):
             etype = event.get("type", "")
             if etype == "text-delta":
                 full_text += event.get("delta", "")

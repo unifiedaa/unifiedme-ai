@@ -36,6 +36,20 @@ from .gumloop.tool_converter import convert_messages_with_tools, parse_tool_call
 
 log = logging.getLogger("unified.proxy_gumloop")
 
+_EXPERIMENT_COMPACT_HISTORY_ENV = "UNIFIED_GL_EXPERIMENT_COMPACT_HISTORY"
+_EXPERIMENT_TRIM_TOOL_RESULTS_ENV = "UNIFIED_GL_EXPERIMENT_TRIM_TOOL_RESULTS"
+_EXPERIMENT_SUMMARY_CHARS = 1800
+_EXPERIMENT_RECENT_WINDOW = 6
+_EXPERIMENT_TOOL_RESULT_CHARS = 900
+_TOOL_RESULT_MARKERS = (
+    "> **[Tool]**",
+    "> **[Result]**",
+    "<tool_use",
+    "<tool_result",
+    "[Tool result for",
+    "[Called tool:",
+)
+
 # Auth cache: account_id → GumloopAuth
 _auth_cache: dict[int, GumloopAuth] = {}
 
@@ -52,6 +66,32 @@ GUMLOOP_MODELS = [
     "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
     "gpt-5.3-code", "gpt-5.2", "gpt-5.2-codex",
 ]
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _experiment_compact_history_enabled() -> bool:
+    return _env_flag(_EXPERIMENT_COMPACT_HISTORY_ENV)
+
+
+def _experiment_trim_tool_results_enabled() -> bool:
+    return _env_flag(_EXPERIMENT_TRIM_TOOL_RESULTS_ENV)
+
+
+def _trim_old_tool_result_text(text: str) -> str:
+    if not text or not _experiment_trim_tool_results_enabled():
+        return text
+    if not any(marker in text for marker in _TOOL_RESULT_MARKERS):
+        return text
+    if len(text) <= _EXPERIMENT_TOOL_RESULT_CHARS:
+        return text
+    omitted = len(text) - _EXPERIMENT_TOOL_RESULT_CHARS
+    return (
+        text[:_EXPERIMENT_TOOL_RESULT_CHARS]
+        + f"\n...[trimmed old tool/result content: {omitted} chars omitted]"
+    )
 
 
 def _get_turnstile() -> TurnstileSolver:
@@ -370,10 +410,32 @@ def _render_delta_context(messages: list[dict]) -> str:
     for msg in messages:
         role = str(msg.get("role", "")).strip().upper() or "USER"
         content = _message_text_for_overlap(msg.get("content", ""))
+        content = _trim_old_tool_result_text(content)
         if not content:
             continue
         lines.append(f"{role}: {content}")
     lines.append("</delta_history>")
+    return "\n".join(lines)
+
+
+def _build_summary_recent_context(summary_text: str, recent_messages: list[dict]) -> str:
+    lines = [
+        "You are continuing a conversation from the same OpenCode session but with a different upstream account.",
+        "Below is a compacted summary of prior conversation followed by recent messages.",
+        "",
+        "<session_summary>",
+        summary_text,
+        "</session_summary>",
+    ]
+    if recent_messages:
+        lines.extend(["", "<recent_messages>"])
+        for msg in recent_messages:
+            role = str(msg.get("role", "")).upper()
+            content = _message_text_for_overlap(msg.get("content", ""))
+            content = _trim_old_tool_result_text(content)
+            if content:
+                lines.append(f"{role}: {content}")
+        lines.append("</recent_messages>")
     return "\n".join(lines)
 
 
@@ -433,9 +495,13 @@ async def _rehydrate_openai_messages_if_needed(db, chat_session_id: int | None, 
     summary_watermark = summary_row["watermark_message_id"] if summary_row else 0
     summary_text = summary_row["summary_text"] if summary_row else ""
 
+    compact_history = _experiment_compact_history_enabled()
+    summary_max_chars = _EXPERIMENT_SUMMARY_CHARS if compact_history else None
+    recent_window = _EXPERIMENT_RECENT_WINDOW if compact_history else _RECENT_WINDOW
+
     if total_count <= _RECENT_WINDOW and not summary_text:
         all_rows = await db.get_chat_messages(chat_session_id)
-        summary_text = compact_messages(all_rows)
+        summary_text = compact_messages(all_rows, max_chars=summary_max_chars or 4000)
         await db.upsert_session_summary(chat_session_id, summary_text, latest_id, total_count)
         summary_watermark = latest_id
         log.info("[REHYDRATE] first-bind small-history compacted directly: session=%s watermark=%s msg_count=%s", chat_session_id, latest_id, total_count)
@@ -443,39 +509,21 @@ async def _rehydrate_openai_messages_if_needed(db, chat_session_id: int | None, 
     # Large history: use summary + recent window
         if should_compact(total_count, summary_watermark, latest_id) or not summary_text:
             all_rows = await db.get_chat_messages(chat_session_id)
-            summary_text = compact_messages(all_rows)
+            summary_text = compact_messages(all_rows, max_chars=summary_max_chars or 4000)
             await db.upsert_session_summary(chat_session_id, summary_text, latest_id, total_count)
             summary_watermark = latest_id
         log.info("[REHYDRATE] regenerated summary: session=%s watermark=%s msg_count=%s summary_len=%s", chat_session_id, summary_watermark, total_count, len(summary_text))
 
-    recent_rows = await db.get_session_messages_between(chat_session_id, max(0, summary_watermark - _RECENT_WINDOW), limit=_RECENT_WINDOW)
+    recent_rows = await db.get_session_messages_between(chat_session_id, max(0, summary_watermark - recent_window), limit=recent_window)
     if not recent_rows:
-        recent_rows = await db.get_session_messages_after(chat_session_id, max(0, latest_id - _RECENT_WINDOW))
+        recent_rows = await db.get_session_messages_after(chat_session_id, max(0, latest_id - recent_window))
 
     recent_messages = _persisted_rows_to_openai_messages(recent_rows) if recent_rows else []
 
-    context_parts = []
-    context_parts.append("You are continuing a conversation from the same OpenCode session but with a different upstream account.")
-    context_parts.append("Below is a compacted summary of prior conversation followed by recent messages.")
-    context_parts.append("")
-    context_parts.append("<session_summary>")
-    context_parts.append(summary_text)
-    context_parts.append("</session_summary>")
-
-    if recent_messages:
-        context_parts.append("")
-        context_parts.append("<recent_messages>")
-        for msg in recent_messages:
-            role = str(msg.get("role", "")).upper()
-            content = _message_text_for_overlap(msg.get("content", ""))
-            if content:
-                context_parts.append(f"{role}: {content}")
-        context_parts.append("</recent_messages>")
-
-    context_message = {"role": "system", "content": "\n".join(context_parts)}
+    context_message = {"role": "system", "content": _build_summary_recent_context(summary_text, recent_messages)}
     inject_count = len(recent_messages) + 1
-    log.info("[REHYDRATE] first-bind summary+recent inject: session=%s account=%s summary_len=%s recent=%s total_stored=%s",
-             chat_session_id, account_id, len(summary_text), len(recent_messages), total_count)
+    log.info("[REHYDRATE] first-bind summary+recent inject: session=%s account=%s summary_len=%s recent=%s total_stored=%s compact=%s trim_tools=%s",
+             chat_session_id, account_id, len(summary_text), len(recent_messages), total_count, compact_history, _experiment_trim_tool_results_enabled())
     return [context_message, *current_messages], {"injected": True, "count": inject_count, "mode": "summary_delta"}
 
 
@@ -496,7 +544,8 @@ async def _update_rehydration_watermark(chat_session_id: int | None, account_id:
 
         if should_compact(total_count, summary_watermark, latest_id):
             all_rows = await db.get_chat_messages(chat_session_id)
-            summary_text = compact_messages(all_rows)
+            summary_max_chars = _EXPERIMENT_SUMMARY_CHARS if _experiment_compact_history_enabled() else 4000
+            summary_text = compact_messages(all_rows, max_chars=summary_max_chars)
             await db.upsert_session_summary(chat_session_id, summary_text, latest_id, total_count)
             log.info("[REHYDRATE] background summary update: session=%s watermark=%s msgs=%s",
                      chat_session_id, latest_id, total_count)

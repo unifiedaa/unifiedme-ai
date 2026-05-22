@@ -18,6 +18,7 @@ from typing import Any, AsyncGenerator, Optional
 
 import httpx
 import websockets
+from websockets.exceptions import InvalidHandshake, InvalidMessage, InvalidStatus
 
 from .auth import GumloopAuth
 from .turnstile import TurnstileSolver
@@ -28,13 +29,15 @@ WS_URL = "wss://ws.gumloop.com/ws/gummies"
 API_BASE = "https://api.gumloop.com"
 MAX_CONCURRENT = int(os.getenv("GL_MAX_CONCURRENT", "5"))
 _chat_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+DEFAULT_WS_OPEN_TIMEOUT = float(os.getenv("GL_WS_OPEN_TIMEOUT", "30"))
+DEFAULT_WS_HANDSHAKE_RETRIES = int(os.getenv("GL_WS_HANDSHAKE_RETRIES", "3"))
 
 
 async def update_gummie_config(
     gummie_id: str,
     auth: GumloopAuth,
     system_prompt: str | None = None,
-    tools: list[dict] | None = None,
+    tools: list[dict[str, Any]] | None = None,
     model_name: str | None = None,
     proxy_url: str | None = None,
 ) -> dict[str, Any]:
@@ -192,13 +195,15 @@ async def send_chat(
     turnstile: TurnstileSolver | None = None,
     interaction_id: str | None = None,
     proxy_url: str | None = None,
+    open_timeout: float | None = None,
+    handshake_retries: int | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Send chat message via WebSocket and yield response events."""
     async with _chat_semaphore:
         for attempt in range(1, MAX_TURNSTILE_RETRIES + 1):
             got_turnstile_error = False
             async for event in _send_chat_inner(
-                gummie_id, messages, auth, turnstile, interaction_id, proxy_url
+                gummie_id, messages, auth, turnstile, interaction_id, proxy_url, open_timeout, handshake_retries
             ):
                 if event.get("type") == "error":
                     err_msg = str(event.get("error", ""))
@@ -242,6 +247,8 @@ async def _send_chat_inner(
     turnstile: TurnstileSolver | None = None,
     interaction_id: str | None = None,
     proxy_url: str | None = None,
+    open_timeout: float | None = None,
+    handshake_retries: int | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     id_token = await auth.get_token()
 
@@ -325,28 +332,58 @@ async def _send_chat_inner(
     # WebSocket connection — don't use HTTP proxy pool for WS
     # (SOCKS proxies often don't support WebSocket upgrade)
     # websockets 13+: additional_headers; websockets 12: extra_headers
-    _ws_ver = int(websockets.__version__.split(".")[0])
+    _ws_ver = int(str(getattr(websockets, "__version__", "13.0")).split(".")[0])
     _hdr_key = "additional_headers" if _ws_ver >= 13 else "extra_headers"
     ws_kwargs: dict[str, Any] = {
         _hdr_key: {"Origin": "https://www.gumloop.com"},
+        "open_timeout": open_timeout if open_timeout is not None else DEFAULT_WS_OPEN_TIMEOUT,
     }
+    payload_str = json.dumps(payload)
+    has_captcha = "yes" if turnstile_token else "no"
+    max_handshake_retries = handshake_retries if handshake_retries is not None else DEFAULT_WS_HANDSHAKE_RETRIES
 
-    async with websockets.connect(WS_URL, **ws_kwargs) as ws:
-        payload_str = json.dumps(payload)
-        has_captcha = "yes" if turnstile_token else "no"
-        log.info("[WS] Sending (%d bytes), captcha=%s", len(payload_str), has_captcha)
-        await ws.send(payload_str)
+    for attempt in range(1, max_handshake_retries + 1):
+        try:
+            async with websockets.connect(WS_URL, **ws_kwargs) as ws:
+                log.info(
+                    "[WS] Sending (%d bytes), captcha=%s, handshake_attempt=%s/%s, open_timeout=%s",
+                    len(payload_str),
+                    has_captcha,
+                    attempt,
+                    max_handshake_retries,
+                    ws_kwargs["open_timeout"],
+                )
+                await ws.send(payload_str)
 
-        async for message in ws:
-            try:
-                event = json.loads(message)
-                yield event
-                # Only break on final finish (multi-step tool calls have final=false)
-                if event.get("type") == "finish":
-                    if event.get("final", True):
-                        break
-            except json.JSONDecodeError:
-                continue
+                async for message in ws:
+                    try:
+                        event = json.loads(message)
+                        yield event
+                        if event.get("type") == "finish" and event.get("final", True):
+                            break
+                    except json.JSONDecodeError:
+                        continue
+                return
+        except (TimeoutError, InvalidHandshake, InvalidMessage, InvalidStatus) as e:
+            if attempt >= max_handshake_retries:
+                yield {"type": "error", "error": f"websocket opening handshake failed after {attempt} attempts: {e}"}
+                return
+            backoff = min(2 ** (attempt - 1), 8)
+            log.warning(
+                "[WS] Opening handshake failed attempt %s/%s; retrying in %ss: %s",
+                attempt,
+                max_handshake_retries,
+                backoff,
+                e,
+            )
+            yield {
+                "type": "handshake_retry",
+                "attempt": attempt,
+                "max": max_handshake_retries,
+                "retry_after": backoff,
+                "error": str(e) or e.__class__.__name__,
+            }
+            await asyncio.sleep(backoff)
 
 
 class GumloopStreamHandler:
