@@ -812,9 +812,9 @@ def _stream_gumloop_v2(
                 # --- Tool call from Gumloop agent (streamed as visible content) ---
                 elif etype == "tool-call":
                     tool_name = event.get("toolName", "?")
-                    if tool_name in _GL2_REMOTE_TOOL_EVENT_NAMES:
-                        log.info("[GL2 stream] suppress remote tool-call echo: %s", tool_name)
-                        continue
+                    # if tool_name in _GL2_REMOTE_TOOL_EVENT_NAMES:
+                    #     log.info("[GL2 stream] suppress remote tool-call echo: %s", tool_name)
+                    #     continue
                     tool_input = event.get("input", {})
                     input_preview = json.dumps(tool_input, ensure_ascii=False)
                     if len(input_preview) > 200:
@@ -827,9 +827,9 @@ def _stream_gumloop_v2(
                 # --- Tool result from Gumloop agent (streamed as visible content) ---
                 elif etype == "tool-result":
                     tool_name = event.get("toolName", "?")
-                    if tool_name in _GL2_REMOTE_TOOL_EVENT_NAMES:
-                        log.info("[GL2 stream] suppress remote tool-result echo: %s", tool_name)
-                        continue
+                    # if tool_name in _GL2_REMOTE_TOOL_EVENT_NAMES:
+                    #     log.info("[GL2 stream] suppress remote tool-result echo: %s", tool_name)
+                    #     continue
                     output = event.get("output", "")
                     if isinstance(output, dict):
                         result_text = output.get("stdout", "") or output.get("stderr", "") or json.dumps(output, ensure_ascii=False)
