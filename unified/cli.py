@@ -41,6 +41,10 @@ import sys
 import time
 from pathlib import Path
 
+from .env_loader import load_local_env
+
+load_local_env()
+
 from .config import LISTEN_PORT, DATA_DIR, VERSION, CENTRAL_API_URL
 
 PID_FILE = DATA_DIR / "proxy.pid"

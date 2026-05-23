@@ -47,6 +47,7 @@ _ASSISTANT_NOISE_PATTERNS = (
 
 _EXPERIMENT_COMPACT_HISTORY_ENV = "UNIFIED_GL_EXPERIMENT_COMPACT_HISTORY"
 _EXPERIMENT_TRIM_TOOL_RESULTS_ENV = "UNIFIED_GL_EXPERIMENT_TRIM_TOOL_RESULTS"
+_GL2_TRUST_INTERACTION_STATE_ENV = "UNIFIED_GL2_TRUST_INTERACTION_STATE"
 _EXPERIMENT_SUMMARY_CHARS = 1800
 _EXPERIMENT_RECENT_WINDOW = 6
 _EXPERIMENT_TOOL_RESULT_CHARS = 900
@@ -87,6 +88,10 @@ def _experiment_compact_history_enabled() -> bool:
 
 def _experiment_trim_tool_results_enabled() -> bool:
     return _env_flag(_EXPERIMENT_TRIM_TOOL_RESULTS_ENV)
+
+
+def _trust_gl2_interaction_state_enabled() -> bool:
+    return os.getenv(_GL2_TRUST_INTERACTION_STATE_ENV, "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _trim_old_tool_result_text(text: str) -> str:
@@ -475,6 +480,23 @@ def _count_meaningful_rehydration_messages(messages: list[dict]) -> int:
     return count
 
 
+def _is_gumloop_model(model: str) -> bool:
+    model_l = str(model or "").lower()
+    return model_l.startswith("gl-") or model_l.startswith("gl2-") or "gumloop" in model_l
+
+
+def _delta_has_external_assistant(messages: list[dict]) -> bool:
+    for msg in messages:
+        if str(msg.get("role", "")) != "assistant":
+            continue
+        content = _message_text_for_overlap(msg.get("content", ""))
+        content = sanitize_assistant_transcript(content)
+        content = _trim_old_tool_result_text(content)
+        if content and not _is_gumloop_model(str(msg.get("model", ""))):
+            return True
+    return False
+
+
 async def _rehydrate_openai_messages_if_needed(db, chat_session_id: int | None, account_id: int, current_messages: list[dict]) -> tuple[list[dict], dict]:
     """Returns (messages, rehydration_info) where rehydration_info has keys:
     - injected: bool
@@ -512,19 +534,39 @@ async def _rehydrate_openai_messages_if_needed(db, chat_session_id: int | None, 
             log.info("[REHYDRATE] same-account delta rows empty after filter: session=%s", chat_session_id)
             return no_inject
 
-        meaningful_delta_count = _count_meaningful_rehydration_messages(delta_messages)
-        if meaningful_delta_count <= 0:
+        if _trust_gl2_interaction_state_enabled() and not _delta_has_external_assistant(delta_rows):
+            latest_delta_id = max((int(row.get("id", 0) or 0) for row in delta_rows), default=0)
+            if latest_delta_id:
+                await db.update_binding_watermark(chat_session_id, account_id, latest_delta_id)
             log.info(
-                "[REHYDRATE] same-account delta skipped after sanitize: session=%s account=%s watermark=%s raw_count=%s",
+                "[REHYDRATE] same-account delta skipped; trusting live Gumloop interaction: session=%s account=%s watermark=%s raw_count=%s latest_delta_id=%s",
+                chat_session_id,
+                account_id,
+                watermark,
+                len(delta_rows),
+                latest_delta_id,
+            )
+            return no_inject
+
+        meaningful_delta_count = _count_meaningful_rehydration_messages(delta_messages)
+        latest_delta_id = max((int(row.get("id", 0) or 0) for row in delta_rows), default=0)
+        if meaningful_delta_count <= 0:
+            if latest_delta_id:
+                await db.update_binding_watermark(chat_session_id, account_id, latest_delta_id)
+            log.info(
+                "[REHYDRATE] same-account delta skipped after sanitize and watermark advanced: session=%s account=%s watermark=%s raw_count=%s latest_delta_id=%s",
                 chat_session_id,
                 account_id,
                 watermark,
                 len(delta_messages),
+                latest_delta_id,
             )
             return no_inject
 
         context_message = {"role": "system", "content": _render_delta_context(delta_messages)}
-        log.info("[REHYDRATE] same-account delta inject: session=%s account=%s watermark=%s raw_count=%s meaningful_count=%s", chat_session_id, account_id, watermark, len(delta_messages), meaningful_delta_count)
+        if latest_delta_id:
+            await db.update_binding_watermark(chat_session_id, account_id, latest_delta_id)
+        log.info("[REHYDRATE] same-account delta inject with watermark advance: session=%s account=%s watermark=%s raw_count=%s meaningful_count=%s latest_delta_id=%s", chat_session_id, account_id, watermark, len(delta_messages), meaningful_delta_count, latest_delta_id)
         return [context_message, *current_messages], {"injected": True, "count": meaningful_delta_count, "mode": "delta"}
 
     # --- First bind of a different account to this session ---

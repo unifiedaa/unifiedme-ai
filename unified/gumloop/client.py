@@ -31,6 +31,20 @@ MAX_CONCURRENT = int(os.getenv("GL_MAX_CONCURRENT", "5"))
 _chat_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 DEFAULT_WS_OPEN_TIMEOUT = float(os.getenv("GL_WS_OPEN_TIMEOUT", "30"))
 DEFAULT_WS_HANDSHAKE_RETRIES = int(os.getenv("GL_WS_HANDSHAKE_RETRIES", "3"))
+# Tools that are ALWAYS blocked (destructive remote sandbox execution)
+_REMOTE_SANDBOX_TOOL_NAMES = {
+    "sandbox_shell", "sandbox_python",
+    "sandbox_upload", "sandbox_download",
+    "invoke_agent", "add_server_awaiter",
+    "trigger_discovery", "list_trigger_options",
+    "create_integration_trigger", "manage_integration_trigger",
+    "create_schedule", "manage_schedule", "create_mcp_trigger",
+}
+# Artifact paths that indicate Gumloop reading its own internal context (allowed)
+_GL_ARTIFACT_PATH_PREFIXES = (
+    "/home/user/.uploads/",
+    "custom_agent_interactions/",
+)
 
 
 async def update_gummie_config(
@@ -358,6 +372,51 @@ async def _send_chat_inner(
                 async for message in ws:
                     try:
                         event = json.loads(message)
+                        if event.get("type") == "tool-call":
+                            tool_name = str(event.get("toolName", ""))
+                            tool_input = event.get("input", {})
+                            if tool_name in _REMOTE_SANDBOX_TOOL_NAMES:
+                                log.error("[WS] Forbidden remote tool execution detected: %s", tool_name)
+                                yield {
+                                    "type": "blocked_remote_tool_attempt",
+                                    "toolName": tool_name,
+                                    "input": tool_input,
+                                    "reason": "Gumloop native sandbox/tool path is disabled; only local OpenCode tools are allowed.",
+                                }
+                                await ws.close()
+                                yield {
+                                    "type": "error",
+                                    "error": (
+                                        f"Forbidden remote tool execution detected: {tool_name}. "
+                                        "Gumloop native sandbox/tool path is disabled; only local OpenCode tools are allowed."
+                                    ),
+                                    "errorType": "forbidden_remote_tool_execution",
+                                }
+                                return
+                            if tool_name in ("sandbox_file", "sandbox_match"):
+                                action = str(tool_input.get("action", "")).lower() if isinstance(tool_input, dict) else ""
+                                path_val = str(tool_input.get("path", "")) if isinstance(tool_input, dict) else ""
+                                is_artifact_read = (
+                                    action in ("read", "view", "")
+                                    and any(path_val.startswith(p) for p in _GL_ARTIFACT_PATH_PREFIXES)
+                                )
+                                if is_artifact_read:
+                                    log.info("[WS] Allowing Gumloop internal artifact read: %s %s", tool_name, path_val[:120])
+                                else:
+                                    log.error("[WS] Blocked non-artifact sandbox tool: %s action=%s path=%s", tool_name, action, path_val[:120])
+                                    yield {
+                                        "type": "blocked_remote_tool_attempt",
+                                        "toolName": tool_name,
+                                        "input": tool_input,
+                                        "reason": f"sandbox_file/match only allowed for internal artifact reads, not action={action} path={path_val[:80]}",
+                                    }
+                                    await ws.close()
+                                    yield {
+                                        "type": "error",
+                                        "error": f"Blocked non-artifact sandbox tool: {tool_name} action={action}",
+                                        "errorType": "forbidden_remote_tool_execution",
+                                    }
+                                    return
                         yield event
                         if event.get("type") == "finish" and event.get("final", True):
                             break

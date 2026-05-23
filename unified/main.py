@@ -11,6 +11,10 @@ import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from .env_loader import load_local_env
+
+load_local_env()
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse

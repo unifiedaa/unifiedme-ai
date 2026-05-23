@@ -46,6 +46,18 @@ CRITICAL OUTPUT RULES:
 - Do NOT say what tool you will use. Just emit the <tool_use> XML immediately.
 - Do NOT print tool arguments outside the <input> JSON.
 - For direct file reads like "read file X", your entire response must be a single <tool_use> block for read.
+- OpenCode local tools are the ONLY real execution environment. There is NO usable sandbox filesystem.
+- If the user gives an absolute Windows path like C:\\Users\\... or D:\\..., that exact path is authoritative and local.
+- Use the exact user-provided Windows path with local OpenCode tools. Do NOT reinterpret it as /home/user/..., /mnt/..., root-relative, or a mounted sandbox path.
+- Never claim a user-provided Windows path is inaccessible from a sandbox. There is no sandbox executor for this task.
+- If asked to create/update/replace a file and the user provided a local Windows path, your final target must be that exact local path.
+- Do NOT treat /home/user/.uploads/..., custom_agent_interactions/..., or other transient artifact paths as the final workspace when the user provided a real local path.
+- Do NOT say work is complete in a mounted artifact if the requested local Windows file was not read/written with local OpenCode tools.
+- Treat local Windows/workspace paths (for example C:\\... or relative project files) as readable with local tools.
+- Treat provider artifact paths like /home/user/.uploads/... or custom_agent_interactions/... as NON-local transient artifacts.
+- Never convert /home/user/.uploads/... into a Windows/local path. If you only have an artifact path, use the original source/result instead of local read.
+- If a provider artifact path cannot be read with local tools, do NOT retry the same read via read/sandbox_file/bash. Explain that it is a remote artifact path and ask for the original/local source path or artifact contents.
+- For remote URLs/repo paths: if a fetch/webfetch request returns 404 or path-not-found, do NOT repeat the same guessed path pattern. Pivot to listing/searching the parent location first, then retry only with evidence.
 
 The proxy converts this XML into OpenAI tool_calls executed locally on the user's machine.
 </CRITICAL_INSTRUCTION>
@@ -63,11 +75,20 @@ _GL2_EXPERIMENT_CACHE_CONFIG_ENV = "UNIFIED_GL2_EXPERIMENT_CACHE_CONFIG"
 _GL2_WS_OPEN_TIMEOUT_ENV = "UNIFIED_GL2_WS_OPEN_TIMEOUT"
 _GL2_WS_HANDSHAKE_RETRIES_ENV = "UNIFIED_GL2_WS_HANDSHAKE_RETRIES"
 _GL2_DEBUG_PROMPT_BREAKDOWN_ENV = "UNIFIED_GL2_DEBUG_PROMPT_BREAKDOWN"
+_GL2_COMPRESS_SYSTEM_PROMPT_ENV = "UNIFIED_GL2_COMPRESS_SYSTEM_PROMPT"
 _GL2_TOOL_ALLOWLIST = {
     "read", "write", "edit", "grep", "glob", "bash", "todowrite", "question",
     "read_many", "list", "task", "fetch", "webfetch", "lsp_diagnostics",
     "lsp_find_references", "lsp_goto_definition", "lsp_rename", "lsp_symbols",
-    "apply_patch",
+    "apply_patch", "skill",
+}
+# Tools that must NEVER pass through to OpenCode — dropped silently after remap attempt.
+_GL2_BLOCKED_TOOLS = {
+    "sandbox_upload", "sandbox_download",
+    "invoke_agent", "add_server_awaiter",
+    "trigger_discovery", "list_trigger_options",
+    "create_integration_trigger", "manage_integration_trigger",
+    "create_schedule", "manage_schedule", "create_mcp_trigger",
 }
 _gl2_config_cache: dict[str, str] = {}
 
@@ -167,10 +188,116 @@ def _normalize_gl2_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return normalized
 
 
+_GL2_STRIP_SECTIONS = (
+    "available_tools_you_can_use", "integration_execution_priority",
+    "tool_usage_guidelines", "file_references", "available_skills",
+    "execution_guidance", "interaction_etiquette", "platform_identity",
+    "trigger_creation", "self_modification", "sandbox_environment",
+    "agent_context", "execution_limits", "subagent_delegation",
+    "file_exploration", "file_organization", "output_handling",
+    "available_packages", "agent_workspace", "previously_generated_files",
+    "gumcp_servers",
+)
+_GL2_STRIP_RE = re.compile(
+    r"<(?:" + "|".join(_GL2_STRIP_SECTIONS) + r")>[\s\S]*?</(?:" + "|".join(_GL2_STRIP_SECTIONS) + r")>",
+    re.IGNORECASE,
+)
+
+
+def _compress_gl2_system_prompt(prompt: str) -> str:
+    if not prompt or not _env_flag(_GL2_COMPRESS_SYSTEM_PROMPT_ENV):
+        return prompt
+    original_len = len(prompt)
+    compressed = _GL2_STRIP_RE.sub("", prompt)
+    compressed = re.sub(r"\n{3,}", "\n\n", compressed)
+    compressed = compressed.strip()
+    if len(compressed) < original_len:
+        log.info("[GL2_COMPRESS] system prompt %d -> %d chars (-%d%%)",
+                 original_len, len(compressed),
+                 int((1 - len(compressed) / original_len) * 100) if original_len else 0)
+    return compressed
+
+
 _TOOL_ROOT_KEY: dict[str, str] = {
     "question": "questions",
     "todowrite": "todos",
 }
+
+_GL2_ARTIFACT_PATH_PREFIXES = (
+    "/home/user/.uploads/",
+    "custom_agent_interactions/",
+)
+
+
+def _extract_tool_path(data: dict[str, Any]) -> str:
+    return str(
+        data.get("path")
+        or data.get("filePath")
+        or data.get("file")
+        or data.get("file_path")
+        or ""
+    )
+
+
+def _is_gl2_artifact_path(path: str) -> bool:
+    p = path.strip()
+    if not p:
+        return False
+    return p.startswith(_GL2_ARTIFACT_PATH_PREFIXES)
+
+
+def _is_local_readable_path(path: str) -> bool:
+    p = path.strip()
+    if not p:
+        return False
+    if _is_gl2_artifact_path(p):
+        return False
+    if re.match(r"^[A-Za-z]:[\\/]", p):
+        return True
+    if p.startswith("\\\\"):
+        return True
+    if p.startswith("./") or p.startswith("../"):
+        return True
+    if p.startswith("/"):
+        return False
+    return True
+
+
+def _artifact_path_tool_result(path: str, tool_name: str) -> dict[str, Any]:
+    msg = (
+        f"Remote artifact path cannot be executed with local tool '{tool_name}': {path}. "
+        "This path belongs to Gumloop/provider transient storage, not the local filesystem. "
+        "Need original local/source path or artifact contents instead of retrying local read/remap."
+    )
+    return {
+        "id": f"call_{uuid.uuid4().hex[:24]}",
+        "type": "function",
+        "function": {
+            "name": "question",
+            "arguments": json.dumps(
+                {
+                    "questions": [
+                        {
+                            "header": "Artifact path blocked",
+                            "multiple": False,
+                            "question": msg,
+                            "options": [
+                                {
+                                    "label": "Provide local path",
+                                    "description": "Give original local/workspace path instead of Gumloop artifact path.",
+                                },
+                                {
+                                    "label": "Provide contents",
+                                    "description": "Paste artifact/file contents directly so work can continue without local read.",
+                                },
+                            ],
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+        },
+    }
 
 
 def _remap_gl2_remote_tool(name: str, args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -178,10 +305,17 @@ def _remap_gl2_remote_tool(name: str, args: dict[str, Any]) -> tuple[str, dict[s
         action = str(args.get("action", "")).lower()
         mapped = {
             "read": "read",
+            "view": "read",
             "write": "write",
+            "append": "write",
             "edit": "edit",
+            "str_replace": "edit",
         }.get(action)
         if mapped:
+            path_value = _extract_tool_path(args)
+            if mapped == "read" and path_value and not _is_local_readable_path(path_value):
+                log.info("[GL2_TOOLS] Keeping sandbox_file read unremapped for non-local artifact path: %s", path_value[:200])
+                return name, args
             cleaned = dict(args)
             cleaned.pop("action", None)
             cleaned.pop("content", None)
@@ -212,6 +346,9 @@ def _remap_gl2_remote_tool(name: str, args: dict[str, Any]) -> tuple[str, dict[s
             return "grep", cleaned
         if action == "glob":
             return "glob", cleaned
+    if name == "sandbox_python":
+        code = args.get("code", "")
+        return "bash", {"command": f"python3 << 'PYEOF'\n{code}\nPYEOF", "description": "Execute Python code"}
     return name, args
 
 
@@ -223,6 +360,14 @@ def _tool_uses_to_openai(tool_uses: list[dict[str, Any]]) -> list[dict[str, Any]
         args = item.get("input", {})
         if isinstance(args, dict):
             name, args = _remap_gl2_remote_tool(name, args)
+            tool_path = _extract_tool_path(args)
+            if tool_path and _is_gl2_artifact_path(tool_path) and name in {"read", "write", "edit", "sandbox_file", "bash"}:
+                log.warning("[GL2_TOOLS] Blocking artifact-path local execution: tool=%s path=%s", name, tool_path[:200])
+                result.append(_artifact_path_tool_result(tool_path, name))
+                continue
+        if name in _GL2_BLOCKED_TOOLS:
+            log.info("[GL2_TOOLS] Dropping blocked tool: %s", name)
+            continue
         args = fix_tool_args(name, args)
         root_key = _TOOL_ROOT_KEY.get(name)
         if root_key and isinstance(args, dict) and root_key not in args:
@@ -303,7 +448,7 @@ async def proxy_chat_completions(
     if not messages:
         return JSONResponse({"error": {"message": "No messages provided", "type": "invalid_request_error"}}, status_code=400), 0.0
 
-    system_prompt = _extract_system(messages)
+    system_prompt = _compress_gl2_system_prompt(_extract_system(messages))
     gumloop_tools = _openai_tools_to_gumloop(body.get("tools", []))
     # Remove MCP-prefixed tools that duplicate standard OpenCode tools.
     # In pure-LLM mode, the LLM should use standard tool names (read, grep, bash)
@@ -348,7 +493,7 @@ async def proxy_chat_completions(
             session_id_int, account_id
         )
         log.info("Created new interaction_id %s for session=%s account=%s", interaction_id, chat_session_id, account_id)
-    system_prompt = _extract_system(messages)
+    system_prompt = _compress_gl2_system_prompt(_extract_system(messages))
     # Re-convert after rehydration, history-only (no system/tools injection)
     converted_messages = convert_messages_with_tools(messages)
 
@@ -471,6 +616,15 @@ _THINKING_CLOSE_PREFIXES = (
     "</th", "</t", "</",
 )
 
+_GL2_REMOTE_TOOL_EVENT_NAMES = {
+    "sandbox_shell", "sandbox_python",
+    "sandbox_upload", "sandbox_download",
+    "invoke_agent", "add_server_awaiter",
+    "trigger_discovery", "list_trigger_options",
+    "create_integration_trigger", "manage_integration_trigger",
+    "create_schedule", "manage_schedule", "create_mcp_trigger",
+}
+
 
 def _safe_flush_point(text: str, start: int) -> int:
     for tag in ("<tool_use", "<thinking>"):
@@ -537,7 +691,6 @@ def _stream_gumloop_v2(
                 "uncached_prompt_tokens": 0,
                 "credits": 0,
             }
-            buffering_notified = False
 
             yield build_openai_chunk(stream_id, display_model, role="assistant", created=created).encode()
 
@@ -573,19 +726,11 @@ def _stream_gumloop_v2(
                                     if streamed_pos < len(full_text) and full_text[streamed_pos] == "\n":
                                         streamed_pos += 1
                                     in_thinking = True
-                                    buffering_notified = False
                                     continue
                                 safe_until = _safe_flush_point(full_text, streamed_pos)
                                 if safe_until > streamed_pos:
                                     yield build_openai_chunk(stream_id, display_model, content=full_text[streamed_pos:safe_until], created=created).encode()
                                     streamed_pos = safe_until
-                                    buffering_notified = False
-                                elif not buffering_notified and (len(full_text) - streamed_pos) > 10:
-                                    yield build_openai_chunk(
-                                        stream_id, display_model,
-                                        content="\n_Preparing tool call..._\n", created=created,
-                                    ).encode()
-                                    buffering_notified = True
                                 break
                             else:
                                 close_pos = full_text.find("</thinking>", streamed_pos)
@@ -614,6 +759,9 @@ def _stream_gumloop_v2(
                 # --- Tool call from Gumloop agent (streamed as visible content) ---
                 elif etype == "tool-call":
                     tool_name = event.get("toolName", "?")
+                    if tool_name in _GL2_REMOTE_TOOL_EVENT_NAMES:
+                        log.info("[GL2 stream] suppress remote tool-call echo: %s", tool_name)
+                        continue
                     tool_input = event.get("input", {})
                     input_preview = json.dumps(tool_input, ensure_ascii=False)
                     if len(input_preview) > 200:
@@ -626,6 +774,9 @@ def _stream_gumloop_v2(
                 # --- Tool result from Gumloop agent (streamed as visible content) ---
                 elif etype == "tool-result":
                     tool_name = event.get("toolName", "?")
+                    if tool_name in _GL2_REMOTE_TOOL_EVENT_NAMES:
+                        log.info("[GL2 stream] suppress remote tool-result echo: %s", tool_name)
+                        continue
                     output = event.get("output", "")
                     if isinstance(output, dict):
                         result_text = output.get("stdout", "") or output.get("stderr", "") or json.dumps(output, ensure_ascii=False)
@@ -637,6 +788,20 @@ def _stream_gumloop_v2(
                     yield build_openai_chunk(
                         stream_id, display_model,
                         content=f"\n> **[Result]** `{tool_name}` \u2192\n> ```\n> {preview}\n> ```\n", created=created,
+                    ).encode()
+
+                elif etype == "blocked_remote_tool_attempt":
+                    tool_name = event.get("toolName", "?")
+                    tool_input = event.get("input", {})
+                    reason = event.get("reason", "Blocked remote tool attempt")
+                    audit_text = (
+                        "\n> **[Gumloop Attempt Blocked]**\n"
+                        f"> tool: `{tool_name}`\n"
+                        f"> input: ```json\n{json.dumps(tool_input, ensure_ascii=False)}\n```\n"
+                        f"> reason: {reason}\n"
+                    )
+                    yield build_openai_chunk(
+                        stream_id, display_model, content=audit_text, created=created,
                     ).encode()
 
                 # --- Step boundary (skip — handled by reasoning flow) ---
@@ -712,13 +877,6 @@ def _stream_gumloop_v2(
                     created=created,
                 ).encode()
 
-            if rehydration_info and rehydration_info.get("injected"):
-                mode = rehydration_info.get("mode", "delta")
-                count = rehydration_info.get("count", 0)
-                status_msg = f"\n\n_[Context synced: {count} messages injected ({mode})]_"
-                yield build_openai_chunk(stream_id, display_model, content=status_msg, created=created).encode()
-                full_text += status_msg
-
             finish_reason = "tool_calls" if tool_uses else "stop"
             yield build_openai_chunk(stream_id, display_model, finish_reason=finish_reason, created=created, usage=usage).encode()
             yield build_openai_done().encode()
@@ -787,6 +945,16 @@ async def _accumulate_gumloop_v2(
             etype = event.get("type", "")
             if etype == "text-delta":
                 full_text += event.get("delta", "")
+            elif etype == "blocked_remote_tool_attempt":
+                tool_name = event.get("toolName", "?")
+                tool_input = event.get("input", {})
+                reason = event.get("reason", "Blocked remote tool attempt")
+                full_text += (
+                    "\n\n[Gumloop Attempt Blocked]\n"
+                    f"tool: {tool_name}\n"
+                    f"input: {json.dumps(tool_input, ensure_ascii=False)}\n"
+                    f"reason: {reason}\n"
+                )
             elif etype == "finish":
                 event_usage = event.get("usage") or {}
                 prompt_tokens += event_usage.get("input_tokens", 0)

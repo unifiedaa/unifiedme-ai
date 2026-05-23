@@ -33,6 +33,13 @@ MAX_CONSECUTIVE_FAILURES = 3
 KEEPALIVE_INTERVAL = 5.0
 
 
+class BlockedRemoteToolAttemptError(RuntimeError):
+    def __init__(self, audit_message: str, tool_name: str):
+        super().__init__(f"Forbidden remote tool execution detected: {tool_name}")
+        self.audit_message = audit_message
+        self.tool_name = tool_name
+
+
 @dataclass
 class LoopBudget:
     max_input: int = MAX_INPUT_TOKENS
@@ -95,6 +102,17 @@ async def _call_gumloop_collect(
         etype = event.get("type", "")
         if etype == "text-delta":
             full_text += event.get("delta", "")
+        elif etype == "blocked_remote_tool_attempt":
+            tool_name = str(event.get("toolName", "?"))
+            tool_input = event.get("input", {})
+            reason = str(event.get("reason", "Blocked remote tool attempt"))
+            audit_message = (
+                "\n\n[Gumloop blocked remote tool attempt]\n"
+                f"tool: {tool_name}\n"
+                f"input: {json.dumps(tool_input, ensure_ascii=False)}\n"
+                f"reason: {reason}\n"
+            )
+            raise BlockedRemoteToolAttemptError(audit_message, tool_name)
         elif etype == "finish":
             event_usage = event.get("usage") or {}
             usage["prompt_tokens"] += event_usage.get("input_tokens", 0)
@@ -151,6 +169,24 @@ async def tool_loop_stream(
                 interaction_id=interaction_id,
                 proxy_url=proxy_url,
             )
+        except BlockedRemoteToolAttemptError as e:
+            log.error("[tool_loop] blocked remote tool attempt: %s", e.tool_name)
+            yield build_openai_chunk(
+                stream_id,
+                display_model,
+                content=e.audit_message,
+                created=created,
+            ).encode()
+            yield build_openai_chunk(
+                stream_id,
+                display_model,
+                content=(
+                    "\nError: Gumloop attempted forbidden remote sandbox execution. "
+                    "Request aborted before execution; only local OpenCode tools are allowed."
+                ),
+                created=created,
+            ).encode()
+            break
         except Exception as e:
             log.error("[tool_loop] Gumloop call failed: %s", e)
             yield build_openai_chunk(

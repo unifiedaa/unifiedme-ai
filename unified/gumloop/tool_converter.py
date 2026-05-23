@@ -85,10 +85,11 @@ def convert_message_content(content: Any) -> Tuple[str, List[Dict[str, Any]], Li
     return "\n".join(text_parts), tool_blocks, image_urls
 
 def tool_result_to_text(tool_result: Dict[str, Any]) -> str:
-    """Convert tool_result block to text format."""
+    """Convert tool_result block to plain authoritative text for model history."""
     tool_use_id = tool_result.get("tool_use_id", "")
     content = tool_result.get("content", "")
     is_error = tool_result.get("is_error", False)
+    tool_name = str(tool_result.get("tool_name", "") or "").strip()
 
     if isinstance(content, list):
         # Extract text from content blocks
@@ -100,8 +101,15 @@ def tool_result_to_text(tool_result: Dict[str, Any]) -> str:
                 text_parts.append(item)
         content = "\n".join(text_parts)
 
-    status = "error" if is_error else "success"
-    return f"<tool_result tool_use_id=\"{tool_use_id}\" status=\"{status}\">\n{content}\n</tool_result>"
+    status = "ERROR" if is_error else "OK"
+    header_parts = ["[Tool Result]"]
+    if tool_name:
+        header_parts.append(f"tool={tool_name}")
+    if tool_use_id:
+        header_parts.append(f"id={tool_use_id}")
+    header_parts.append(f"status={status}")
+    header = " ".join(header_parts)
+    return f"{header}\n{content}" if content else header
 
 def tool_use_to_text(tool_use: Dict[str, Any]) -> str:
     """Convert tool_use block to text format (for assistant messages in history)."""
@@ -188,6 +196,7 @@ def convert_messages_simple(messages: List[Dict[str, Any]]) -> List[Dict[str, An
             tool_content = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False) if content else ""
             result.append({"role": "user", "content": tool_result_to_text({
                 "tool_use_id": tool_call_id,
+                "tool_name": msg.get("name", ""),
                 "content": tool_content,
                 "is_error": msg.get("is_error", False),
             })})
@@ -273,6 +282,7 @@ def convert_messages_with_tools(
             tool_content = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False) if content else ""
             result.append({"role": "user", "content": tool_result_to_text({
                 "tool_use_id": tool_call_id,
+                "tool_name": msg.get("name", ""),
                 "content": tool_content,
                 "is_error": msg.get("is_error", False),
             })})
@@ -401,4 +411,3 @@ def fix_tool_args(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         if wrong_key in args and correct_key not in args:
             args[correct_key] = args.pop(wrong_key)
     return args
-
