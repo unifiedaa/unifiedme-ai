@@ -84,6 +84,10 @@ def convert_message_content(content: Any) -> Tuple[str, List[Dict[str, Any]], Li
 
     return "\n".join(text_parts), tool_blocks, image_urls
 
+_MAX_TOOL_RESULT_CHARS = 3000
+_FILE_BOUNDARY = "═" * 60
+
+
 def tool_result_to_text(tool_result: Dict[str, Any]) -> str:
     """Convert tool_result block to plain authoritative text for model history."""
     tool_use_id = tool_result.get("tool_use_id", "")
@@ -92,7 +96,6 @@ def tool_result_to_text(tool_result: Dict[str, Any]) -> str:
     tool_name = str(tool_result.get("tool_name", "") or "").strip()
 
     if isinstance(content, list):
-        # Extract text from content blocks
         text_parts = []
         for item in content:
             if isinstance(item, dict) and item.get("type") == "text":
@@ -101,15 +104,13 @@ def tool_result_to_text(tool_result: Dict[str, Any]) -> str:
                 text_parts.append(item)
         content = "\n".join(text_parts)
 
+    if len(content) > _MAX_TOOL_RESULT_CHARS:
+        content = content[:_MAX_TOOL_RESULT_CHARS] + f"\n[truncated at {_MAX_TOOL_RESULT_CHARS} chars — use read with offset to see more]"
+
     status = "ERROR" if is_error else "OK"
-    header_parts = ["[Tool Result]"]
-    if tool_name:
-        header_parts.append(f"tool={tool_name}")
-    if tool_use_id:
-        header_parts.append(f"id={tool_use_id}")
-    header_parts.append(f"status={status}")
-    header = " ".join(header_parts)
-    return f"{header}\n{content}" if content else header
+    header = f"{_FILE_BOUNDARY}\n[TOOL RESULT] tool={tool_name or 'unknown'} id={tool_use_id} status={status}\n{_FILE_BOUNDARY}"
+    footer = f"\n{_FILE_BOUNDARY} END tool={tool_name or 'unknown'} {_FILE_BOUNDARY}"
+    return f"{header}\n{content}{footer}" if content else header
 
 def tool_use_to_text(tool_use: Dict[str, Any]) -> str:
     """Convert tool_use block to text format (for assistant messages in history)."""

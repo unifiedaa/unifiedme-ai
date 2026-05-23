@@ -18,7 +18,7 @@ from .gumloop.parser import build_openai_chunk, build_openai_done, build_openai_
 from .gumloop.tool_converter import convert_messages_with_tools, parse_tool_calls, tools_to_system_prompt
 from .proxy_gumloop import (
     _ensure_turnstile_key, _ext_from_media_type, _extract_image_data,
-    _get_auth, _get_turnstile, _rehydrate_openai_messages_if_needed,
+    _get_auth, _get_turnstile,
 )
 
 log = logging.getLogger("unified.proxy_gumloop_v2")
@@ -58,6 +58,9 @@ CRITICAL OUTPUT RULES:
 - Never convert /home/user/.uploads/... into a Windows/local path. If you only have an artifact path, use the original source/result instead of local read.
 - If a provider artifact path cannot be read with local tools, do NOT retry the same read via read/sandbox_file/bash. Explain that it is a remote artifact path and ask for the original/local source path or artifact contents.
 - For remote URLs/repo paths: if a fetch/webfetch request returns 404 or path-not-found, do NOT repeat the same guessed path pattern. Pivot to listing/searching the parent location first, then retry only with evidence.
+- Tool results may be truncated to ~3000 chars. If you see "[truncated at 3000 chars]", do NOT re-read the same file hoping for different results. Use offset parameter to read the next section, or proceed with available content.
+- If multiple tool results appear merged or mixed, use the ═══ boundary markers to identify where each result starts and ends. Do NOT re-read files just because results look concatenated.
+- NEVER read the same file more than twice in one response. If content seems incomplete after 2 reads, proceed with what you have and ask the user if more context is needed.
 
 The proxy converts this XML into OpenAI tool_calls executed locally on the user's machine.
 </CRITICAL_INSTRUCTION>
@@ -91,6 +94,29 @@ _GL2_BLOCKED_TOOLS = {
     "create_schedule", "manage_schedule", "create_mcp_trigger",
 }
 _gl2_config_cache: dict[str, str] = {}
+
+_REHYDRATION_LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+
+
+def _write_rehydration_log(session_id: int, account_id: int, info: dict[str, Any], error: str = "") -> None:
+    try:
+        os.makedirs(_REHYDRATION_LOG_DIR, exist_ok=True)
+        filename = f"session-{session_id}-rehydration.log"
+        filepath = os.path.join(_REHYDRATION_LOG_DIR, filename)
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        status = "ERROR" if error else ("INJECTED" if info.get("injected") else "SKIPPED")
+        line = (
+            f"[{ts}] account={account_id} status={status} "
+            f"mode={info.get('mode', 'none')} count={info.get('count', 0)}"
+        )
+        if error:
+            line += f" error={error}"
+        line += "\n"
+        with open(filepath, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
 
 
 def _env_flag(name: str) -> bool:
@@ -481,12 +507,30 @@ async def proxy_chat_completions(
         except (TypeError, ValueError) as e:
             log.warning("Invalid chat_session_id '%s': %s", chat_session_id, e)
 
-    messages, rehydration_info = await _rehydrate_openai_messages_if_needed(
-        db,
-        session_id_int if session_id_int else None,
-        account_id,
-        messages,
-    )
+    rehydration_info = {"injected": False, "count": 0, "mode": "none"}
+    rehydration_error = ""
+
+    if session_id_int and account_id:
+        try:
+            session_row = await db.get_chat_session(session_id_int)
+            last_account = int(session_row.get("last_gumloop_account_id", 0) or 0) if session_row else 0
+            is_cross_account = last_account > 0 and last_account != account_id
+            if is_cross_account:
+                from .proxy_gumloop import _rehydrate_openai_messages_if_needed
+                messages, rehydration_info = await _rehydrate_openai_messages_if_needed(
+                    db, session_id_int, account_id, messages,
+                )
+                converted_messages = convert_messages_with_tools(messages)
+                log.info("[GL2_REHYDRATE] cross-account rehydration: session=%s prev_account=%s new_account=%s injected=%s count=%s mode=%s",
+                         session_id_int, last_account, account_id,
+                         rehydration_info.get("injected"), rehydration_info.get("count"), rehydration_info.get("mode"))
+        except Exception as e:
+            rehydration_error = str(e)
+            log.error("[GL2_REHYDRATE] failed: session=%s account=%s error=%s", session_id_int, account_id, e)
+
+    _write_rehydration_log(session_id_int, account_id, rehydration_info, rehydration_error)
+    if rehydration_error:
+        rehydration_info["error"] = rehydration_error
 
     if not interaction_id and session_id_int and account_id:
         interaction_id = await db.get_or_create_gumloop_interaction_for_session_account(
@@ -693,6 +737,15 @@ def _stream_gumloop_v2(
             }
 
             yield build_openai_chunk(stream_id, display_model, role="assistant", created=created).encode()
+
+            if rehydration_info and rehydration_info.get("injected"):
+                rh_mode = rehydration_info.get("mode", "?")
+                rh_count = rehydration_info.get("count", 0)
+                rh_msg = f"_[Rehydration OK: {rh_count} messages injected ({rh_mode})]_\n\n"
+                yield build_openai_chunk(stream_id, display_model, content=rh_msg, created=created).encode()
+            elif rehydration_info and rehydration_info.get("error"):
+                rh_msg = f"_[Rehydration FAILED: {rehydration_info['error']}]_\n\n"
+                yield build_openai_chunk(stream_id, display_model, content=rh_msg, created=created).encode()
 
             async for event in send_chat(
                 gummie_id,
