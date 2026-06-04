@@ -5,6 +5,18 @@ cd "$(dirname "$0")"
 # Create logs dir
 mkdir -p logs
 
+# Load persisted license key for direct uvicorn startup
+LICENSE_FILE="unified/data/.license"
+if [ -z "$LICENSE_KEY" ] && [ -f "$LICENSE_FILE" ]; then
+    LICENSE_KEY=$(tr -d '\r\n' < "$LICENSE_FILE")
+    export LICENSE_KEY
+fi
+
+if [ -z "$LICENSE_KEY" ]; then
+    echo "ERROR: LICENSE_KEY not set and $LICENSE_FILE not found/empty"
+    exit 1
+fi
+
 # Kill existing if running
 if [ -f server.pid ]; then
     OLD_PID=$(cat server.pid)

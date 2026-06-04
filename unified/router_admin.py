@@ -1094,6 +1094,90 @@ async def sync_d1_pull(request: Request, _: bool = Depends(verify_admin)):
     }
 
 
+@router.get("/accounts/gl/check-disabled")
+async def check_gl_disabled(request: Request, _: bool = Depends(verify_admin)):
+    """Check all GL accounts with gl_status=ok for USER_DISABLED. Marks + returns results."""
+    all_accts = await db.get_accounts()
+    gl_accts = [a for a in all_accts
+                if a.get("gl_status") == "ok" and a.get("gl_refresh_token")]
+
+    from .gumloop.auth import GumloopAuth, UserDisabledError as _UserDisabledError
+    import httpx as _httpx
+
+    results: list[dict] = []
+    for acct in gl_accts:
+        acct_id = acct["id"]
+        refresh_tok = acct.get("gl_refresh_token", "")
+        auth = GumloopAuth(
+            refresh_token=refresh_tok,
+            user_id=acct.get("gl_user_id", ""),
+            id_token=acct.get("gl_id_token", ""),
+        )
+        try:
+            await auth.get_token()
+            results.append({"id": acct_id, "email": acct.get("email", "?"),
+                            "status": "ok"})
+        except _UserDisabledError:
+            # Mark account in DB
+            await db.update_account(acct_id, gl_status="user_disabled",
+                                    gl_error="USER_DISABLED")
+            results.append({"id": acct_id, "email": acct.get("email", "?"),
+                            "status": "user_disabled", "error": "USER_DISABLED"})
+            log.warning("GL account %s (%s) marked as user_disabled",
+                        acct_id, acct.get("email", "?"))
+        except Exception as exc:
+            results.append({"id": acct_id, "email": acct.get("email", "?"),
+                            "status": "error", "error": str(exc)[:200]})
+
+    disabled_count = sum(1 for r in results if r["status"] == "user_disabled")
+    ok_count = sum(1 for r in results if r["status"] == "ok")
+    return {
+        "ok": True,
+        "total_checked": len(results),
+        "working": ok_count,
+        "user_disabled": disabled_count,
+        "other_errors": len(results) - ok_count - disabled_count,
+        "results": results,
+    }
+
+
+@router.post("/accounts/gl/check-disabled/relogin")
+async def relogin_gl_disabled(request: Request, _: bool = Depends(verify_admin)):
+    """Trigger batch re-login for all GL accounts marked as user_disabled."""
+    all_accts = await db.get_accounts()
+    disabled = [a for a in all_accts if a.get("gl_status") == "user_disabled"]
+
+    if not disabled:
+        return {"ok": True, "message": "No user_disabled accounts found", "queued": 0}
+
+    # Build (email, password) tuples — password may be empty, batch runner will use stored tokens
+    accounts: list[tuple[str, str]] = []
+    for acct in disabled:
+        email = acct.get("email", "")
+        password = acct.get("password", "")
+        if email:
+            accounts.append((email, password))
+
+    if not accounts:
+        return {"ok": False, "message": "No accounts with email found", "queued": 0}
+
+    # Mark them back to "none" so batch runner does full signup flow
+    for acct in disabled:
+        await db.update_account(acct["id"], gl_status="none", gl_error="",
+                                gl_refresh_token="", gl_id_token="", gl_user_id="")
+
+    from .batch_runner import start_batch as _start_batch
+    queued = await _start_batch(accounts, providers=["gumloop"],
+                                 headless=True, concurrency=2)
+
+    return {
+        "ok": True,
+        "message": f"Queued {queued} accounts for re-login",
+        "queued": queued,
+        "accounts": [a[0] for a in accounts],
+    }
+
+
 @router.get("/accounts/refresh-credits")
 async def refresh_all_credits_get(request: Request, _: bool = Depends(verify_admin)):
     """Refresh credits for all active accounts (GET)."""

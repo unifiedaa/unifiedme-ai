@@ -15,6 +15,21 @@ import httpx
 
 log = logging.getLogger("unified.gumloop.auth")
 
+
+class GumloopAuthError(Exception):
+    """Base exception for Gumloop auth errors."""
+    pass
+
+
+class UserDisabledError(GumloopAuthError):
+    """Raised when the Firebase user is disabled (USER_DISABLED).
+    
+    The Firebase Auth user record has been disabled (likely by Gumloop).
+    Stored refresh tokens cannot be used. Account needs browser re-login
+    to obtain fresh tokens, or the account itself must be replaced.
+    """
+    pass
+
 FIREBASE_API_KEY = "AIzaSyCYuXqbJ0YBNltoGS4-7Y6Hozrra8KKmaE"
 FIREBASE_REFRESH_URL = f"https://securetoken.googleapis.com/v1/token?key={FIREBASE_API_KEY}"
 
@@ -55,7 +70,17 @@ class GumloopAuth:
         }
         async with _get_http_client(self.proxy_url) as client:
             resp = await client.post(FIREBASE_REFRESH_URL, data=payload)
-            resp.raise_for_status()
+            if resp.status_code != 200:
+                detail = resp.text[:500]
+                # Detect USER_DISABLED — account needs browser re-login
+                if '"USER_DISABLED"' in detail:
+                    raise UserDisabledError(
+                        f"Firebase token refresh failed (HTTP {resp.status_code}): {detail}"
+                    )
+                raise httpx.HTTPStatusError(
+                    f"Firebase token refresh failed (HTTP {resp.status_code}): {detail}",
+                    request=resp.request, response=resp,
+                )
             data = resp.json()
 
         self.id_token = data.get("id_token", self.id_token)

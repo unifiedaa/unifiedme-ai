@@ -310,9 +310,24 @@ def convert_messages_with_tools(
     return merge_consecutive_messages(result)
 
 # Regex patterns for parsing tool calls
-TOOL_USE_PATTERN = re.compile(
-    r'<tool_use(?:\s+id="([^"]*)")?>\s*<name>([^<]+)</name>\s*<input>(.*?)</input>\s*</tool_use>',
-    re.DOTALL
+TOOL_USE_BLOCK_PATTERN = re.compile(
+    r"<tool_use\b([^>]*)>(.*?)</tool_use>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+TOOL_USE_ID_ATTR_PATTERN = re.compile(
+    r'\bid\s*=\s*"([^"]*)"',
+    re.IGNORECASE,
+)
+
+TOOL_USE_NAME_PATTERN = re.compile(
+    r"<name\b[^>]*>(.*?)</name>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+TOOL_USE_INPUT_PATTERN = re.compile(
+    r"<input\b[^>]*>(.*?)</input>",
+    re.DOTALL | re.IGNORECASE,
 )
 
 def parse_tool_calls(text: str) -> Tuple[str, List[Dict[str, Any]]]:
@@ -322,10 +337,20 @@ def parse_tool_calls(text: str) -> Tuple[str, List[Dict[str, Any]]]:
     """
     tool_uses = []
 
-    for match in TOOL_USE_PATTERN.finditer(text):
-        tool_id = match.group(1) or f"toolu_{uuid.uuid4().hex[:24]}"
-        name = match.group(2).strip()
-        input_str = match.group(3).strip()
+    for match in TOOL_USE_BLOCK_PATTERN.finditer(text):
+        attrs = match.group(1) or ""
+        block_body = match.group(2) or ""
+
+        id_match = TOOL_USE_ID_ATTR_PATTERN.search(attrs)
+        name_match = TOOL_USE_NAME_PATTERN.search(block_body)
+        input_match = TOOL_USE_INPUT_PATTERN.search(block_body)
+
+        if not name_match or not input_match:
+            continue
+
+        tool_id = (id_match.group(1).strip() if id_match else "") or f"toolu_{uuid.uuid4().hex[:24]}"
+        name = name_match.group(1).strip()
+        input_str = input_match.group(1).strip()
 
         try:
             input_data = json.loads(input_str)
@@ -340,7 +365,7 @@ def parse_tool_calls(text: str) -> Tuple[str, List[Dict[str, Any]]]:
         })
 
     # Remove tool_use blocks from text
-    remaining_text = TOOL_USE_PATTERN.sub("", text).strip()
+    remaining_text = TOOL_USE_BLOCK_PATTERN.sub("", text).strip()
 
     return remaining_text, tool_uses
 

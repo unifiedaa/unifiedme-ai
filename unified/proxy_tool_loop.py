@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
+
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .gumloop.client import send_chat, update_gummie_config
 from .gumloop.parser import build_openai_chunk, build_openai_done
@@ -23,6 +26,17 @@ from .gumloop.tool_converter import (
     tools_to_system_prompt,
 )
 from .loop_tools import SUPPORTED_TOOLS, execute_tool
+from .proxy_gumloop import _ensure_turnstile_key, _get_auth, _get_turnstile
+from .proxy_gumloop_v2 import (
+    LLM_ONLY_OVERRIDE,
+    _compress_gl2_system_prompt,
+    _extract_system,
+    _filter_duplicate_mcp_tools,
+    _map_gl2_model,
+    _normalize_gl2_tools,
+    _openai_tools_to_gumloop,
+    _write_rehydration_log,
+)
 
 log = logging.getLogger("unified.proxy_tool_loop")
 
@@ -31,6 +45,170 @@ MAX_INPUT_TOKENS = 150_000
 MAX_OUTPUT_TOKENS = 32_000
 MAX_CONSECUTIVE_FAILURES = 3
 KEEPALIVE_INTERVAL = 5.0
+
+
+def _contains_tool_xml(text: str) -> bool:
+    return bool(text and re.search(r"<tool_use\b|</tool_use>", text, re.IGNORECASE))
+
+
+def _tool_xml_blocked_message(stage: str) -> str:
+    return (
+        f"\n[Internal tool-call parsing guard triggered during {stage}. "
+        "Tool XML was withheld instead of being streamed raw. "
+        "Please retry the request.]"
+    )
+
+
+async def proxy_chat_completions(
+    body: dict[str, Any],
+    account: dict[str, Any],
+    client_wants_stream: bool,
+    proxy_url: str | None = None,
+) -> tuple[StreamingResponse | JSONResponse, float]:
+    """GL2 proxy path with server-side local tool execution.
+
+    Used for /v1/chat/completions when client sends tools for gl2-* models.
+    """
+    from . import database as db
+    from .proxy_gumloop import _rehydrate_openai_messages_if_needed
+
+    auth = _get_auth(account)
+    await _ensure_turnstile_key()
+    turnstile = _get_turnstile()
+    gummie_id = account.get("gl_gummie_id", "")
+    if not gummie_id:
+        return JSONResponse({"error": {"message": "Account has no gummie_id", "type": "server_error"}}, status_code=503), 0.0
+
+    raw_model = body.get("model", "gl2-claude-sonnet-4-5")
+    gl_model = _map_gl2_model(raw_model)
+    messages = body.get("messages", [])
+    if not messages:
+        return JSONResponse({"error": {"message": "No messages provided", "type": "invalid_request_error"}}, status_code=400), 0.0
+
+    gumloop_tools = _openai_tools_to_gumloop(body.get("tools", []))
+    gumloop_tools = _filter_duplicate_mcp_tools(gumloop_tools)
+    gumloop_tools = _normalize_gl2_tools(gumloop_tools)
+    system_prompt = _compress_gl2_system_prompt(_extract_system(messages))
+    converted_messages = convert_messages_with_tools(messages)
+
+    account_id = account.get("id", 0)
+    interaction_id = None
+    chat_session_id = body.get("chat_session_id")
+    session_id_int = 0
+    if chat_session_id and account_id:
+        try:
+            session_id_int = int(chat_session_id)
+            existing_binding = await db.get_gumloop_binding(session_id_int, account_id)
+            if existing_binding:
+                interaction_id = existing_binding
+        except (TypeError, ValueError):
+            session_id_int = 0
+
+    rehydration_info = {"injected": False, "count": 0, "mode": "none"}
+    rehydration_error = ""
+    if session_id_int and account_id:
+        try:
+            session_row = await db.get_chat_session(session_id_int)
+            last_account = int(session_row.get("last_gumloop_account_id", 0) or 0) if session_row else 0
+            is_cross_account = last_account > 0 and last_account != account_id
+            if is_cross_account:
+                messages, rehydration_info = await _rehydrate_openai_messages_if_needed(
+                    db, session_id_int, account_id, messages,
+                )
+                converted_messages = convert_messages_with_tools(messages)
+        except Exception as e:
+            rehydration_error = str(e)
+            log.error("[GL2_TOOL_LOOP_REHYDRATE] failed: session=%s account=%s error=%s", session_id_int, account_id, e)
+
+    _write_rehydration_log(session_id_int, account_id, rehydration_info, rehydration_error)
+    if not interaction_id and session_id_int and account_id:
+        interaction_id = await db.get_or_create_gumloop_interaction_for_session_account(session_id_int, account_id)
+    if not interaction_id:
+        interaction_id = str(uuid.uuid4()).replace("-", "")[:22]
+
+    tool_prompt = tools_to_system_prompt(gumloop_tools) if gumloop_tools else ""
+    combined_system = system_prompt or ""
+    if tool_prompt:
+        combined_system = (combined_system + "\n\n" + tool_prompt) if combined_system else tool_prompt
+    combined_system = LLM_ONLY_OVERRIDE + "\n\n" + combined_system
+
+    try:
+        await update_gummie_config(
+            gummie_id=gummie_id,
+            auth=auth,
+            system_prompt=combined_system or None,
+            tools=[],
+            model_name=gl_model,
+            proxy_url=proxy_url,
+        )
+    except Exception as e:
+        log.warning("Failed to update GL2 tool-loop gummie config: %s", e)
+
+    if client_wants_stream:
+        resp = StreamingResponse(
+            tool_loop_stream(
+                gummie_id=gummie_id,
+                messages=converted_messages,
+                auth=auth,
+                turnstile=turnstile,
+                display_model=raw_model,
+                interaction_id=interaction_id,
+                proxy_url=proxy_url,
+                gumloop_tools=gumloop_tools,
+                system_prompt=combined_system,
+                rehydration_info=rehydration_info,
+            ),
+            status_code=200,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
+        return resp, 0.0
+
+    chunks: list[bytes] = []
+    async for chunk in tool_loop_stream(
+        gummie_id=gummie_id,
+        messages=converted_messages,
+        auth=auth,
+        turnstile=turnstile,
+        display_model=raw_model,
+        interaction_id=interaction_id,
+        proxy_url=proxy_url,
+        gumloop_tools=gumloop_tools,
+        system_prompt=combined_system,
+        rehydration_info=rehydration_info,
+    ):
+        chunks.append(chunk)
+
+    content_parts: list[str] = []
+    usage: dict[str, Any] = {}
+    for raw in chunks:
+        text = raw.decode("utf-8", errors="replace").strip()
+        if not text.startswith("data: ") or text == "data: [DONE]":
+            continue
+        try:
+            payload = json.loads(text[6:])
+        except json.JSONDecodeError:
+            continue
+        choice = (payload.get("choices") or [{}])[0]
+        delta = choice.get("delta") or {}
+        if delta.get("content"):
+            content_parts.append(delta["content"])
+        if payload.get("usage"):
+            usage = payload["usage"]
+
+    response = {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": raw_model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "".join(content_parts).strip()},
+            "finish_reason": "stop",
+        }],
+        "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+    return JSONResponse(response, status_code=200), 0.0
 
 
 class BlockedRemoteToolAttemptError(RuntimeError):
@@ -134,6 +312,58 @@ def _extract_thinking(text: str) -> tuple[str, str | None]:
     return clean, reasoning
 
 
+def _visible_thinking_block(reasoning: str) -> str:
+    text = reasoning.strip()
+    if not text:
+        return ""
+    first_line, _, rest = text.partition("\n")
+    header = f"\nThought: {first_line.strip()}"
+    if rest.strip():
+        return f"{header}\n\n{rest.strip()}\n"
+    return header + "\n"
+
+
+def _compact_tool_args(tool_input: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key, value in tool_input.items():
+        shown = value
+        if isinstance(value, str):
+            if key.lower().endswith(("path", "filepath", "file_path")):
+                shown = os.path.basename(value.rstrip("/\\")) or value
+            if len(shown) > 80:
+                shown = shown[:77] + "..."
+        elif isinstance(value, (list, dict)):
+            shown = json.dumps(value, ensure_ascii=False)
+            if len(shown) > 80:
+                shown = shown[:77] + "..."
+        parts.append(f"{key}={shown}")
+    return ", ".join(parts)
+
+
+def _visible_iteration_block(iteration: int, tool_uses: list[dict[str, Any]]) -> str:
+    tool_lines: list[str] = [
+        f"\nUsing {len(tool_uses)} tool(s) - iteration {iteration}"
+    ]
+    for index, tu in enumerate(tool_uses, start=1):
+        tool_name = tu.get("name", "?")
+        tool_input = tu.get("input", {})
+        args_preview = _compact_tool_args(tool_input)
+        line = f"  {index}. {tool_name}"
+        if args_preview:
+            line += f"({args_preview})"
+        tool_lines.append(line)
+    return "\n".join(tool_lines) + "\n"
+
+
+def _visible_tool_result(tool_name: str, result: str, ok: bool) -> str:
+    label = "done" if ok else "failed"
+    preview = result.strip()
+    preview = re.sub(r"\n{3,}", "\n\n", preview)
+    if len(preview) > 700:
+        preview = preview[:697] + "..."
+    return f"\n{tool_name} -> {label}\n{preview}\n"
+
+
 async def tool_loop_stream(
     gummie_id: str,
     messages: list[dict[str, Any]],
@@ -205,21 +435,29 @@ async def tool_loop_stream(
             if reasoning:
                 yield build_openai_chunk(
                     stream_id, display_model,
-                    reasoning_content=reasoning,
+                    content=_visible_thinking_block(reasoning),
                     created=created,
                 ).encode()
             if remaining_text:
-                yield build_openai_chunk(
-                    stream_id, display_model,
-                    content=remaining_text,
-                    created=created,
-                ).encode()
+                if _contains_tool_xml(remaining_text):
+                    log.warning("[tool_loop] parser missed tool XML during main loop; suppressing raw XML stream")
+                    yield build_openai_chunk(
+                        stream_id, display_model,
+                        content=_tool_xml_blocked_message("main loop"),
+                        created=created,
+                    ).encode()
+                else:
+                    yield build_openai_chunk(
+                        stream_id, display_model,
+                        content=remaining_text,
+                        created=created,
+                    ).encode()
             break
 
         iteration_msg = f"[Executing {len(tool_uses)} tool(s) internally, iteration {budget.iteration + 1}...]"
         yield build_openai_chunk(
             stream_id, display_model,
-            reasoning_content=iteration_msg,
+            content=_visible_iteration_block(budget.iteration + 1, tool_uses),
             created=created,
         ).encode()
 
@@ -233,10 +471,15 @@ async def tool_loop_stream(
             total_tool_calls += 1
 
             if tool_name not in SUPPORTED_TOOLS:
-                result_xml = _format_tool_error_xml(
-                    tool_id, tool_name, f"Unknown tool: {tool_name}"
-                )
+                error_text = f"Unknown tool: {tool_name}"
+                result_xml = _format_tool_error_xml(tool_id, tool_name, error_text)
                 tool_results.append(result_xml)
+                yield build_openai_chunk(
+                    stream_id,
+                    display_model,
+                    content=_visible_tool_result(tool_name, error_text, ok=False),
+                    created=created,
+                ).encode()
                 consecutive_failures += 1
                 continue
 
@@ -247,9 +490,21 @@ async def tool_loop_stream(
 
             if result.startswith("ERROR:"):
                 tool_results.append(_format_tool_error_xml(tool_id, tool_name, result))
+                yield build_openai_chunk(
+                    stream_id,
+                    display_model,
+                    content=_visible_tool_result(tool_name, result, ok=False),
+                    created=created,
+                ).encode()
                 consecutive_failures += 1
             else:
                 tool_results.append(_format_tool_result_xml(tool_id, tool_name, result))
+                yield build_openai_chunk(
+                    stream_id,
+                    display_model,
+                    content=_visible_tool_result(tool_name, result, ok=True),
+                    created=created,
+                ).encode()
                 consecutive_failures = 0
 
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
@@ -274,10 +529,18 @@ async def tool_loop_stream(
                 )
                 budget.record(final_usage)
                 clean_final, reasoning_final = _extract_thinking(final_text)
+                final_remaining, final_tool_uses = parse_tool_calls(clean_final)
                 if reasoning_final:
-                    yield build_openai_chunk(stream_id, display_model, reasoning_content=reasoning_final, created=created).encode()
-                if clean_final:
-                    yield build_openai_chunk(stream_id, display_model, content=clean_final, created=created).encode()
+                    yield build_openai_chunk(stream_id, display_model, content=_visible_thinking_block(reasoning_final), created=created).encode()
+                if final_tool_uses:
+                    log.warning("[tool_loop] final failure fallback returned tool XML; suppressing raw XML stream")
+                    yield build_openai_chunk(stream_id, display_model, content=_tool_xml_blocked_message("failure fallback"), created=created).encode()
+                elif final_remaining:
+                    if _contains_tool_xml(final_remaining):
+                        log.warning("[tool_loop] parser left raw tool XML during failure fallback; suppressing stream")
+                        yield build_openai_chunk(stream_id, display_model, content=_tool_xml_blocked_message("failure fallback"), created=created).encode()
+                    else:
+                        yield build_openai_chunk(stream_id, display_model, content=final_remaining, created=created).encode()
             except Exception as e:
                 yield build_openai_chunk(stream_id, display_model, content=f"\nFailed to get final answer: {e}", created=created).encode()
             break
@@ -299,10 +562,18 @@ async def tool_loop_stream(
             )
             budget.record(final_usage)
             clean_final, reasoning_final = _extract_thinking(final_text)
+            final_remaining, final_tool_uses = parse_tool_calls(clean_final)
             if reasoning_final:
-                yield build_openai_chunk(stream_id, display_model, reasoning_content=reasoning_final, created=created).encode()
-            if clean_final:
-                yield build_openai_chunk(stream_id, display_model, content=clean_final, created=created).encode()
+                yield build_openai_chunk(stream_id, display_model, content=_visible_thinking_block(reasoning_final), created=created).encode()
+            if final_tool_uses:
+                log.warning("[tool_loop] budget fallback returned tool XML; suppressing raw XML stream")
+                yield build_openai_chunk(stream_id, display_model, content=_tool_xml_blocked_message("budget fallback"), created=created).encode()
+            elif final_remaining:
+                if _contains_tool_xml(final_remaining):
+                    log.warning("[tool_loop] parser left raw tool XML during budget fallback; suppressing stream")
+                    yield build_openai_chunk(stream_id, display_model, content=_tool_xml_blocked_message("budget fallback"), created=created).encode()
+                else:
+                    yield build_openai_chunk(stream_id, display_model, content=final_remaining, created=created).encode()
         except Exception as e:
             yield build_openai_chunk(stream_id, display_model, content=f"\nBudget exceeded, failed final call: {e}", created=created).encode()
 

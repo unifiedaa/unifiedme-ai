@@ -8,6 +8,7 @@ import logging
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Request, Depends
 from fastapi.responses import JSONResponse
@@ -95,7 +96,7 @@ async def _persist_assistant_response(chat_session_id: int, response, model: str
 
 
 @router.post("/chat/completions")
-async def chat_completions(request: Request, key_info: dict = Depends(verify_api_key)):
+async def chat_completions(request: Request, key_info: dict[str, Any] = Depends(verify_api_key)):
     """Route chat completion requests to the appropriate upstream based on model tier."""
     start = time.monotonic()
 
@@ -159,6 +160,16 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
     asyncio.create_task(license_client.scan_watchwords(body, model=model))
 
     client_wants_stream = body.get("stream", False)
+    has_tools = bool(body.get("tools"))
+
+    log.info(
+        "[REQ_META] model=%r has_tools=%s stream=%s opencode_session=%r chat_session_id=%r",
+        model,
+        has_tools,
+        client_wants_stream,
+        opencode_session_key,
+        body.get("chat_session_id"),
+    )
 
     # Capture request info for logging (after filter, so logs show filtered body)
     req_headers_str = _capture_request_headers(request)
@@ -464,8 +475,11 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
                 continue
 
             if model.startswith("gl2-"):
+                gl_branch = "gl2-v2"
+                log.info("[GL_ROUTE] model=%r branch=%s account_id=%s", model, gl_branch, account["id"])
                 response, cost = await gumloop_v2_proxy(body, account, client_wants_stream, proxy_url=proxy_url)
             else:
+                log.info("[GL_ROUTE] model=%r branch=gl-v1 account_id=%s", model, account["id"])
                 response, cost = await gumloop_proxy(body, account, client_wants_stream, proxy_url=proxy_url)
             latency = int((time.monotonic() - start) * 1000)
             status = response.status_code if hasattr(response, "status_code") else 200
@@ -1327,7 +1341,7 @@ async def chat_completions(request: Request, key_info: dict = Depends(verify_api
 
 
 @router.post("/messages")
-async def messages(request: Request, key_info: dict = Depends(verify_api_key)):
+async def messages(request: Request, key_info: dict[str, Any] = Depends(verify_api_key)):
     """Anthropic /v1/messages format — route to Kiro with account rotation."""
     start = time.monotonic()
 
@@ -1383,7 +1397,7 @@ async def messages(request: Request, key_info: dict = Depends(verify_api_key)):
 
 
 @router.get("/models")
-async def list_models(key_info: dict = Depends(verify_api_key)):
+async def list_models(key_info: dict[str, Any] = Depends(verify_api_key)):
     """Return combined model list in OpenAI format."""
     models = []
     for model_name, tier in MODEL_TIER.items():

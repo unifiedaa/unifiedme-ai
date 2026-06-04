@@ -680,6 +680,25 @@ async def proxy_chat_completions(
     from . import database as db
     
     auth = _get_auth(account)
+    
+    # Eager auth check — catch USER_DISABLED before any WS traffic
+    from .gumloop.auth import UserDisabledError as _UserDisabledError
+    try:
+        _ = await auth.get_token()
+    except _UserDisabledError:
+        acct_id = account.get("id", 0)
+        if acct_id:
+            await db.update_account(acct_id, gl_status="user_disabled",
+                                    gl_error="USER_DISABLED")
+            gummie_id = account.get("gl_gummie_id", "")
+            log.warning("Account %s (gummie=%s) is USER_DISABLED — marked as user_disabled",
+                        acct_id, gummie_id)
+        return JSONResponse(
+            {"error": {"message": "Account disabled by Gumloop. Run batch re-login for this account.",
+                       "type": "account_disabled"}},
+            status_code=503,
+        ), 0.0
+    
     await _ensure_turnstile_key()
     turnstile = _get_turnstile()
     gummie_id = account.get("gl_gummie_id", "")
