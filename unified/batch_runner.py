@@ -858,10 +858,11 @@ async def _run_codebuddy_intercept(job: AccountJob, proxy_override: str | None =
         if proxy_info:
             proxy_url_used = proxy_info["url"]
 
+    captcha_key = await db.get_setting("captcha_api_key", "") or os.getenv("BATCHER_CAPTCHA_API_KEY", "")
     env = {
         **os.environ,
         "BATCHER_CAMOUFOX_HEADLESS": "true" if batch_state.headless else "false",
-        "BATCHER_CAPTCHA_API_KEY": os.getenv("BATCHER_CAPTCHA_API_KEY", "5ff220e19373d967a494cf020fe454b7"),
+        "BATCHER_CAPTCHA_API_KEY": captcha_key,
     }
     python_bin = str(PYTHON_BIN)
     cb_script = str(CB_INTERCEPT_SCRIPT)

@@ -482,7 +482,7 @@ def _count_meaningful_rehydration_messages(messages: list[dict]) -> int:
 
 def _is_gumloop_model(model: str) -> bool:
     model_l = str(model or "").lower()
-    return model_l.startswith("gl-") or model_l.startswith("gl2-") or "gumloop" in model_l
+    return model_l.startswith("gl-") or model_l.startswith("gl2-") or model_l.startswith("glmcp-") or "gumloop" in model_l
 
 
 def _delta_has_external_assistant(messages: list[dict]) -> bool:

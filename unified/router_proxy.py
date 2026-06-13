@@ -14,7 +14,7 @@ from fastapi import APIRouter, Request, Depends
 from fastapi.responses import JSONResponse
 
 from .auth_middleware import verify_api_key
-from .config import get_tier, Tier, ALL_MODELS, STANDARD_MODELS, MAX_MODELS, WAVESPEED_MODELS, MAX_GL_MODELS, MODEL_TIER, _HIDDEN_ALIASES
+from .config import get_tier, Tier, ALL_MODELS, STANDARD_MODELS, MAX_MODELS, WAVESPEED_MODELS, MAX_GL_MODELS, GLMCP_MODELS, MODEL_TIER, _HIDDEN_ALIASES
 from .account_manager import get_next_account, mark_account_error, mark_account_success
 from .message_filter import filter_messages
 from .proxy_kiro import proxy_chat_completions as kiro_proxy, proxy_messages as kiro_messages
@@ -23,6 +23,7 @@ from .proxy_skillboss import proxy_chat_completions as skillboss_proxy
 from .proxy_wavespeed import proxy_chat_completions as wavespeed_proxy
 from .proxy_gumloop import proxy_chat_completions as gumloop_proxy, _update_rehydration_watermark, sanitize_assistant_transcript
 from .proxy_gumloop_v2 import proxy_chat_completions as gumloop_v2_proxy
+from .proxy_glmcp import proxy_chat_completions as glmcp_proxy
 from .proxy_windsurf import proxy_chat_completions as windsurf_proxy
 from .proxy_therouter import proxy_chat_completions as therouter_proxy
 from .chatbai.proxy import proxy_chat_completions as chatbai_proxy
@@ -474,9 +475,11 @@ async def chat_completions(request: Request, key_info: dict[str, Any] = Depends(
                 await mark_account_error(account["id"], tier, "Missing gl_gummie_id or gl_refresh_token")
                 continue
 
-            if model.startswith("gl2-"):
-                gl_branch = "gl2-v2"
-                log.info("[GL_ROUTE] model=%r branch=%s account_id=%s", model, gl_branch, account["id"])
+            if model.startswith("glmcp-"):
+                log.info("[GL_ROUTE] model=%r branch=glmcp account_id=%s", model, account["id"])
+                response, cost = await glmcp_proxy(body, account, client_wants_stream, proxy_url=proxy_url)
+            elif model.startswith("gl2-"):
+                log.info("[GL_ROUTE] model=%r branch=gl2-v2 account_id=%s", model, account["id"])
                 response, cost = await gumloop_v2_proxy(body, account, client_wants_stream, proxy_url=proxy_url)
             else:
                 log.info("[GL_ROUTE] model=%r branch=gl-v1 account_id=%s", model, account["id"])
