@@ -4263,7 +4263,7 @@ function renderLogs() {
       '<td><span class="badge ' + statusBadge + '">' + statusCode + '</span></td>' +
       '<td class="mono text-sm">' + latency + 'ms</td>' +
       '<td class="text-dim text-sm">' + escHtml(account) + '</td>' +
-      '<td class="mono text-sm text-dim" title="' + escHtml(proxyUrl) + '">' + escHtml(truncateProxy(proxyUrl, 30)) + '</td>' +
+      '<td class="mono text-sm text-dim" title="' + escHtml(proxyUrl) + '">' + escHtml(truncateProxy(proxyUrl, 60)) + '</td>' +
     '</tr>';
   }).join('');
 }
@@ -4624,9 +4624,9 @@ function handleBatchEvent(data) {
                    status === 'failed' || status === 'error' ? 'err' : 'info';
   var logMsg = message || status;
   if (evType === 'job_start' && proxyUsed) {
-    logMsg = 'Starting (' + proxyUsed.replace(/^socks5?:\/\//, '').replace(/^https?:\/\//, '').substring(0, 30) + ')';
+    logMsg = 'Starting (' + proxyUsed.replace(/^socks5?:\/\//, '').replace(/^https?:\/\//, '') + ')';
   } else if (evType === 'job_done' && proxyUsed) {
-    logMsg = (message || status) + ' [proxy: ' + proxyUsed.replace(/^socks5?:\/\//, '').replace(/^https?:\/\//, '').substring(0, 30) + ']';
+    logMsg = (message || status) + ' [proxy: ' + proxyUsed.replace(/^socks5?:\/\//, '').replace(/^https?:\/\//, '') + ']';
   }
   addLog('[' + email + '] ' + logMsg, logLevel);
 }
