@@ -14,7 +14,7 @@ from fastapi import APIRouter, Request, Depends
 from fastapi.responses import JSONResponse
 
 from .auth_middleware import verify_api_key
-from .config import get_tier, Tier, ALL_MODELS, STANDARD_MODELS, MAX_MODELS, WAVESPEED_MODELS, MAX_GL_MODELS, GLMCP_MODELS, MODEL_TIER, _HIDDEN_ALIASES
+from .config import get_tier, Tier, ALL_MODELS, STANDARD_MODELS, MAX_MODELS, WAVESPEED_MODELS, MAX_GL_MODELS, MODEL_TIER, _HIDDEN_ALIASES
 from .account_manager import get_next_account, mark_account_error, mark_account_success
 from .message_filter import filter_messages
 from .proxy_kiro import proxy_chat_completions as kiro_proxy, proxy_messages as kiro_messages
