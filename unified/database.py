@@ -668,10 +668,12 @@ async def get_batch_proxies_for_workers(n: int) -> list[dict]:
     Falls back to API proxy pool if batch pool is empty.
     Each worker gets a different proxy. If no proxies at all, returns [None]*n.
     """
+    enabled = (await get_setting("batch_proxy_enabled", "false")).lower() in ("true", "1")
+    if not enabled:
+        return [None] * n  # type: ignore
     proxies = await get_checked_proxies("batch")
     if not proxies:
-        return [None] * n  # type: ignore — no proxies, workers run without proxy
-    # Cycle through proxies if n > len(proxies)
+        return [None] * n  # type: ignore
     result = []
     for i in range(n):
         result.append({"url": proxies[i % len(proxies)]["url"], "id": proxies[i % len(proxies)]["id"]})
