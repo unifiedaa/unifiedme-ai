@@ -39,6 +39,7 @@ KIRO_ADMIN_PASSWORD = os.getenv("KIRO_ADMIN_PASSWORD", "kUcingku0")
 CODEBUDDY_CREDS_DIR = Path(
     os.getenv("CODEBUDDY_CREDS_DIR", "/root/codebuddy-proxy/.codebuddy_creds")
 )
+GUMLOOP_SCRIPT = Path(__file__).parent / "gumloop_login.py"
 
 # ---------------------------------------------------------------------------
 # State
@@ -70,6 +71,7 @@ class BatchState:
         self.jobs: list[AccountJob] = []
         self.running = False
         self.cancelled = False
+        self.gumloop_mode: str = "none"  # "none", "relogin", "full"
         self._sse_queues: list[asyncio.Queue] = []
         self._lock = asyncio.Lock()
 
@@ -102,8 +104,9 @@ app = FastAPI(title="Batch Login Dashboard")
 
 
 class BatchRequest(BaseModel):
-    accounts: list[str]  # ["email:password", ...]
-    providers: list[str]  # ["kiro", "codebuddy"]
+    accounts: list[str]
+    providers: list[str]
+    gumloop_mode: str = "none"
 
 
 def _auth_ok(request: Request) -> bool:
@@ -140,13 +143,13 @@ async def start_batch(req: BatchRequest, request: Request):
     if not accounts:
         return JSONResponse({"error": "no valid accounts"}, 400)
 
-    providers = [p for p in req.providers if p in ("kiro", "codebuddy")]
+    providers = [p for p in req.providers if p in ("kiro", "codebuddy", "gumloop")]
     if not providers:
         return JSONResponse({"error": "no providers selected"}, 400)
 
-    # Create jobs
     state.jobs.clear()
     state.cancelled = False
+    state.gumloop_mode = req.gumloop_mode if req.gumloop_mode in ("relogin", "full") else "none"
     for email, password in accounts:
         job = AccountJob(
             id=str(uuid.uuid4())[:8],
@@ -257,9 +260,16 @@ async def _run_batch():
 
         try:
             result = await _run_login(job)
+
+            if "gumloop" in job.providers:
+                if state.gumloop_mode == "relogin":
+                    gl_result = await _run_gumloop_relogin(job)
+                else:
+                    gl_result = await _run_gumloop_full(job)
+                result.update(gl_result)
+
             job.result = result
 
-            # Import tokens on success
             imported = []
             if "kiro" in job.providers and result.get("kiro", {}).get("success"):
                 ok = await _import_kiro(job.email, result["kiro"])
@@ -269,6 +279,10 @@ async def _run_batch():
                 ok = await _import_codebuddy(job.email, result["codebuddy"])
                 if ok:
                     imported.append("codebuddy")
+            if "gumloop" in job.providers and result.get("gumloop", {}).get("success"):
+                ok = await _import_gumloop(job.email, result["gumloop"])
+                if ok:
+                    imported.append("gumloop")
 
             any_success = bool(imported)
             job.status = JobStatus.SUCCESS if any_success else JobStatus.FAILED
@@ -283,6 +297,7 @@ async def _run_batch():
                 "duration": round(job.finished_at - job.started_at, 1),
                 "kiro": result.get("kiro", {}).get("success", False),
                 "codebuddy": result.get("codebuddy", {}).get("success", False),
+                "gumloop": result.get("gumloop", {}).get("success", False),
             })
 
         except Exception as exc:
@@ -476,6 +491,178 @@ async def _import_codebuddy(email: str, cb_result: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Gumloop login
+# ---------------------------------------------------------------------------
+
+async def _run_gumloop_relogin(job: AccountJob) -> dict:
+    import httpx
+    from unified import database as udb
+
+    FIREBASE_KEY = "AIzaSyCYuXqbJ0YBNltoGS4-7Y6Hozrra8KKmaE"
+    FIREBASE_AUTH_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_KEY}"
+
+    state.broadcast({"type": "job_log", "job_id": job.id, "email": job.email,
+        "log_type": "info", "provider": "gumloop", "step": "login",
+        "message": "Firebase signInWithPassword..."})
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(FIREBASE_AUTH_URL, json={
+                "email": job.email, "password": job.password,
+                "returnSecureToken": True, "clientType": "CLIENT_TYPE_WEB",
+            })
+            data = resp.json()
+
+        if resp.status_code != 200:
+            err_msg = data.get("error", {}).get("message", f"HTTP {resp.status_code}")
+            state.broadcast({"type": "job_log", "job_id": job.id, "email": job.email,
+                "log_type": "error", "provider": "gumloop", "step": "login",
+                "message": f"Firebase login failed: {err_msg}"})
+            all_accts = await udb.get_accounts()
+            acct = next((a for a in all_accts if a.get("email") == job.email), None)
+            if acct and "USER_DISABLED" in err_msg.upper():
+                await udb.update_account(acct["id"], gl_status="user_disabled", gl_error=err_msg)
+            return {"gumloop": {"success": False, "error": err_msg}}
+
+        id_token = data.get("idToken", "")
+        refresh_token = data.get("refreshToken", "")
+        user_id = data.get("localId", "")
+
+        all_accts = await udb.get_accounts()
+        acct = next((a for a in all_accts if a.get("email") == job.email), None)
+        if acct:
+            await udb.update_account(acct["id"],
+                gl_id_token=id_token, gl_refresh_token=refresh_token,
+                gl_user_id=user_id, gl_status="ok", gl_error="")
+
+        state.broadcast({"type": "job_log", "job_id": job.id, "email": job.email,
+            "log_type": "info", "provider": "gumloop", "step": "login",
+            "message": "Firebase login OK"})
+
+        return {"gumloop": {"success": True, "credentials": {
+            "id_token": id_token, "refresh_token": refresh_token,
+            "user_id": user_id,
+            "gummie_id": acct.get("gl_gummie_id", "") if acct else "",
+        }}}
+    except Exception as e:
+        state.broadcast({"type": "job_log", "job_id": job.id, "email": job.email,
+            "log_type": "error", "provider": "gumloop", "step": "login",
+            "message": f"Firebase login failed: {e}"})
+        return {"gumloop": {"success": False, "error": str(e)}}
+
+
+async def _run_gumloop_full(job: AccountJob) -> dict:
+    env = {
+        **os.environ,
+        "BATCHER_CAMOUFOX_HEADLESS": "true",
+    }
+
+    proc = await asyncio.create_subprocess_exec(
+        str(PYTHON_BIN), str(GUMLOOP_SCRIPT),
+        "--email", job.email, "--password", job.password,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
+    )
+
+    result_data = {}
+
+    async def read_stream(stream, is_stderr=False):
+        nonlocal result_data
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").strip()
+            if not text:
+                continue
+            try:
+                parsed = json.loads(text)
+                if parsed.get("type") == "result":
+                    result_data = parsed
+                state.broadcast({
+                    "type": "job_log", "job_id": job.id, "email": job.email,
+                    "log_type": parsed.get("type", "info"), "provider": "gumloop",
+                    "step": parsed.get("step", ""),
+                    "message": parsed.get("message", parsed.get("error", text)),
+                })
+            except json.JSONDecodeError:
+                log_type = "stderr" if is_stderr else "stdout"
+                state.broadcast({
+                    "type": "job_log", "job_id": job.id, "email": job.email,
+                    "log_type": log_type, "provider": "gumloop",
+                    "step": "", "message": text,
+                })
+
+    await asyncio.gather(
+        read_stream(proc.stdout),
+        read_stream(proc.stderr, is_stderr=True),
+    )
+    await proc.wait()
+
+    gl = result_data.get("gumloop", result_data)
+    if isinstance(gl, dict) and "success" in gl:
+        return {"gumloop": gl}
+    return {"gumloop": {"success": False, "error": "No result from gumloop_login.py"}}
+
+
+async def _import_gumloop(email: str, gl_result: dict) -> bool:
+    from unified import database as udb
+
+    creds = gl_result.get("credentials", {})
+    if not creds.get("id_token"):
+        return False
+
+    try:
+        all_accts = await udb.get_accounts()
+        acct = next((a for a in all_accts if a.get("email") == email), None)
+        if not acct:
+            state.broadcast({"type": "import_error", "provider": "gumloop",
+                "email": email, "error": "Account not found in DB"})
+            return False
+
+        await udb.update_account(acct["id"],
+            gl_id_token=creds["id_token"],
+            gl_refresh_token=creds.get("refresh_token", ""),
+            gl_user_id=creds.get("user_id", ""),
+            gl_gummie_id=creds.get("gummie_id", ""),
+            gl_status="ok", gl_error="")
+
+        state.broadcast({"type": "import_ok", "provider": "gumloop", "email": email})
+        return True
+    except Exception as exc:
+        state.broadcast({"type": "import_error", "provider": "gumloop",
+            "email": email, "error": str(exc)})
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Disabled GL accounts API
+# ---------------------------------------------------------------------------
+
+@app.get("/api/gl/disabled")
+async def get_gl_disabled(request: Request):
+    if not _auth_ok(request):
+        return JSONResponse({"error": "unauthorized"}, 401)
+    from unified import database as udb
+    all_accts = await udb.get_accounts()
+    disabled = [a for a in all_accts if a.get("gl_status") == "user_disabled"]
+    return {"accounts": [{"id": a["id"], "email": a.get("email", "")} for a in disabled]}
+
+
+@app.post("/api/gl/delete")
+async def delete_gl_disabled(request: Request):
+    if not _auth_ok(request):
+        return JSONResponse({"error": "unauthorized"}, 401)
+    from unified import database as udb
+    all_accts = await udb.get_accounts()
+    disabled = [a for a in all_accts if a.get("gl_status") == "user_disabled"]
+    deleted = 0
+    for a in disabled:
+        await udb.delete_account(a["id"])
+        deleted += 1
+    return {"message": f"Deleted {deleted} disabled accounts", "deleted": deleted}
+
+
+# ---------------------------------------------------------------------------
 # Frontend HTML
 # ---------------------------------------------------------------------------
 
@@ -527,6 +714,7 @@ textarea::placeholder{color:var(--muted)}
 .log-line .provider{font-weight:600;margin-right:6px}
 .log-line .provider.kiro{color:var(--accent)}
 .log-line .provider.codebuddy{color:var(--orange)}
+.log-line .provider.gumloop{color:var(--green)}
 .log-line .provider.all{color:var(--yellow)}
 .log-line.success{color:var(--green)}
 .log-line.error{color:var(--red)}
@@ -551,7 +739,14 @@ textarea::placeholder{color:var(--muted)}
 .providers-tags .tag{font-size:.7rem;padding:1px 6px;border-radius:3px;font-weight:600}
 .tag-kiro{background:rgba(108,138,255,.2);color:var(--accent)}
 .tag-codebuddy{background:rgba(251,146,36,.2);color:var(--orange)}
+.tag-gumloop{background:rgba(52,211,153,.2);color:var(--green)}
 
+.disabled-panel{margin-top:4px}
+.disabled-list{display:flex;flex-direction:column;gap:3px;margin:8px 0;max-height:200px;overflow-y:auto}
+.disabled-item{display:flex;align-items:center;justify-content:space-between;padding:4px 10px;border-radius:4px;background:var(--surface2);font-family:'JetBrains Mono',monospace;font-size:.8rem}
+.disabled-item .email{color:var(--text)}.disabled-item .status{color:var(--red);font-size:.7rem;font-weight:600}
+.disabled-actions{display:flex;gap:6px;margin-top:8px}
+.disabled-count{font-size:.8rem;color:var(--muted);margin-left:8px}
 @media(max-width:640px){.controls{flex-direction:column;align-items:stretch}.spacer{display:none}}
 </style>
 </head>
@@ -567,6 +762,11 @@ textarea::placeholder{color:var(--muted)}
       <div class="checkbox-group">
         <label class="checkbox-label"><input type="checkbox" id="cb-kiro" checked> Kiro</label>
         <label class="checkbox-label"><input type="checkbox" id="cb-codebuddy" checked> CodeBuddy</label>
+        <label class="checkbox-label"><input type="checkbox" id="cb-gumloop" checked> Gumloop</label>
+        <select id="gl-mode" style="font-size:.8rem;padding:2px 6px;border-radius:4px;border:1px solid var(--border);background:var(--surface2);color:var(--text)">
+          <option value="full">Full Login</option>
+          <option value="relogin">Relogin Only</option>
+        </select>
       </div>
       <div class="spacer"></div>
       <button class="btn btn-danger" id="btn-cancel" disabled onclick="cancelBatch()">Cancel</button>
@@ -593,6 +793,23 @@ textarea::placeholder{color:var(--muted)}
       <button class="btn" style="padding:4px 12px;font-size:.75rem;background:var(--surface2);color:var(--muted)" onclick="clearLogs()">Clear</button>
     </div>
     <div class="log-viewer" id="log-viewer"></div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+      <div style="display:flex;align-items:center">
+        <div class="card-title" style="margin-bottom:0">Disabled GL Accounts</div>
+        <span class="disabled-count" id="disabled-count"></span>
+      </div>
+      <button class="btn" style="padding:4px 12px;font-size:.75rem;background:var(--surface2);color:var(--muted)" onclick="loadDisabled()">&#8635; Refresh</button>
+    </div>
+    <div class="disabled-panel">
+      <div class="disabled-list" id="disabled-list"><span style="color:var(--muted);font-size:.8rem">Click Refresh to load</span></div>
+      <div class="disabled-actions">
+        <button class="btn" style="padding:4px 12px;font-size:.8rem;background:var(--surface2);color:var(--accent)" onclick="copyDisabledEmails()">&#128203; Copy All</button>
+        <button class="btn btn-danger" style="padding:4px 12px;font-size:.8rem" onclick="deleteDisabledAccounts()">&#128465; Delete All</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -679,6 +896,7 @@ async function startBatch() {
   const providers = [];
   if (document.getElementById('cb-kiro').checked) providers.push('kiro');
   if (document.getElementById('cb-codebuddy').checked) providers.push('codebuddy');
+  if (document.getElementById('cb-gumloop').checked) providers.push('gumloop');
   if (!providers.length) return alert('Select at least one provider');
 
   const accounts = text.split('\\n').map(l => l.trim()).filter(l => l && l.includes(':'));
@@ -692,7 +910,7 @@ async function startBatch() {
     const resp = await fetch('/api/start', {
       method: 'POST',
       headers: headers(),
-      body: JSON.stringify({ accounts, providers }),
+      body: JSON.stringify({ accounts, providers, gumloop_mode: providers.includes('gumloop') ? document.getElementById('gl-mode').value : 'none' }),
     });
     const data = await resp.json();
     if (data.error) {
@@ -808,7 +1026,37 @@ function handleEvent(d) {
   }
 }
 
-// Auto-scroll toggle
+let disabledAccounts = [];
+async function loadDisabled() {
+  try {
+    const resp = await fetch('/api/gl/disabled', { headers: headers() });
+    const data = await resp.json();
+    disabledAccounts = data.accounts || [];
+    const el = document.getElementById('disabled-list');
+    document.getElementById('disabled-count').textContent = disabledAccounts.length ? `(${disabledAccounts.length})` : '';
+    if (!disabledAccounts.length) { el.innerHTML = '<span style="color:var(--muted);font-size:.8rem">No disabled accounts found</span>'; return; }
+    el.innerHTML = disabledAccounts.map(a => `<div class="disabled-item"><span class="email">${a.email}</span><span class="status">DISABLED</span></div>`).join('');
+  } catch(e) { alert('Failed to load: ' + e.message); }
+}
+async function copyDisabledEmails() {
+  if (!disabledAccounts.length) { await loadDisabled(); }
+  if (!disabledAccounts.length) return alert('No disabled accounts');
+  const text = disabledAccounts.map(a => a.email).join('\n');
+  await navigator.clipboard.writeText(text);
+  log(`<span class="ts">${ts()}</span> Copied ${disabledAccounts.length} disabled emails to clipboard`, 'info');
+}
+async function deleteDisabledAccounts() {
+  if (!disabledAccounts.length) { await loadDisabled(); }
+  if (!disabledAccounts.length) return alert('No disabled accounts to delete');
+  if (!confirm(`Delete ${disabledAccounts.length} disabled GL accounts? This cannot be undone.`)) return;
+  try {
+    const resp = await fetch('/api/gl/delete', { method: 'POST', headers: headers() });
+    const data = await resp.json();
+    log(`<span class="ts">${ts()}</span> ${data.message}`, 'info');
+    await loadDisabled();
+  } catch(e) { alert('Delete failed: ' + e.message); }
+}
+
 document.getElementById('log-viewer').addEventListener('scroll', function() {
   const el = this;
   autoScroll = (el.scrollHeight - el.scrollTop - el.clientHeight) < 50;

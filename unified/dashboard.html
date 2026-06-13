@@ -1098,7 +1098,8 @@ a:hover{text-decoration:underline}
           <label><input type="checkbox" id="chk-kiro"> Kiro</label>
           <label><input type="checkbox" id="chk-codebuddy" checked> CodeBuddy</label>
 <label><input type="checkbox" id="chk-wavespeed"> WaveSpeed</label>
-<label><input type="checkbox" id="chk-gumloop"> Gumloop</label>
+<label><input type="checkbox" id="chk-gumloop" onchange="toggleGlOptions()"> Gumloop</label>
+<span id="gl-options" style="display:none;margin-left:4px;padding-left:8px;border-left:1px solid var(--border);font-size:11px"><label><input type="checkbox" id="chk-gl-relogin"> Relogin Only</label></span>
 <label><input type="checkbox" id="chk-chatbai"> ChatBAI</label>
 <label><input type="checkbox" id="chk-skillboss"> SkillBoss</label>
               <label><input type="checkbox" id="chk-therouter" onchange="toggleTrOptions()"> TheRouter</label>
@@ -4502,7 +4503,7 @@ if (document.getElementById('chk-therouter').checked) providers.push('therouter'
   try {
     await apiFetch('/api/batch/start', {
       method: 'POST',
-      body: JSON.stringify({ accounts: lines, providers, headless: document.getElementById('chk-headless').checked, concurrency: parseInt(document.getElementById('batch-concurrency').value) || 1, mcp_urls: (document.getElementById('mcp-urls').value || '').trim().split('\n').filter(function(l){return l.trim();}), tr_domain: trDomain, tr_count: trCount })
+      body: JSON.stringify({ accounts: lines, providers, headless: document.getElementById('chk-headless').checked, concurrency: parseInt(document.getElementById('batch-concurrency').value) || 1, mcp_urls: (document.getElementById('mcp-urls').value || '').trim().split('\n').filter(function(l){return l.trim();}), tr_domain: trDomain, tr_count: trCount, gumloop_mode: document.getElementById('chk-gl-relogin').checked ? 'relogin' : 'full' })
     });
   } catch (e) {
     toast('Batch start failed: ' + e.message, 'error');
@@ -4706,6 +4707,11 @@ function toggleWindsurfMethods() {
 function toggleTrOptions() {
   var show = document.getElementById('chk-therouter').checked;
   document.getElementById('tr-options').style.display = show ? 'inline' : 'none';
+}
+
+function toggleGlOptions() {
+  var show = document.getElementById('chk-gumloop').checked;
+  document.getElementById('gl-options').style.display = show ? 'inline' : 'none';
 }
 
 function getActiveProviders() {

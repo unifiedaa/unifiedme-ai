@@ -90,6 +90,7 @@ class BatchLoginRequest(BaseModel):
     headless: bool = True
     concurrency: int = 1  # parallel browser instances
     mcp_urls: list[str] = []  # MCP server URLs to attach after Gumloop login
+    gumloop_mode: str = "full"  # "full" (browser) or "relogin" (Firebase signInWithPassword)
     # Valid providers: kiro, codebuddy, wavespeed, gumloop
 
 

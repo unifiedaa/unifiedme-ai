@@ -74,6 +74,9 @@ CODEBUDDY_API_KEYS_ENDPOINT = os.getenv(
 CODEBUDDY_REDIRECT_SCHEME = os.getenv(
     "BATCHER_CODEBUDDY_REDIRECT_SCHEME", "codebuddy://"
 )
+CODEBUDDY_CAPTCHA_API_KEY = os.getenv("BATCHER_CAPTCHA_API_KEY", "5ff220e19373d967a494cf020fe454b7")
+CODEBUDDY_CAPTCHA_MAX_ATTEMPTS = int(os.getenv("BATCHER_CAPTCHA_MAX_ATTEMPTS", "3"))
+
 CODEBUDDY_POLL_INTERVAL_SECONDS = float(
     os.getenv("BATCHER_CODEBUDDY_POLL_INTERVAL_SECONDS", "2")
 )
@@ -907,6 +910,188 @@ async def _detect_google_blocking_challenge(page: Any) -> str | None:
         return marker or None
     except Exception:
         return None
+
+
+CAPTCHA_INPUT_SELECTORS = [
+    'input[aria-label*="Type the text"]',
+    'input[aria-label*="type the text"]',
+    '#ca',
+    'input[name="ca"]',
+    'input[type="text"][autocomplete="off"]',
+]
+
+CAPTCHA_IMAGE_SELECTORS = [
+    '#captchaimg',
+    'img[src*="AccountLoginCaptcha"]',
+    'img[alt*="captcha" i]',
+    'img[id*="captcha" i]',
+    'div.captcha-container img',
+    'img[src*="captcha"]',
+]
+
+_captcha_solve_count: int = 0
+_captcha_solve_errors: int = 0
+
+
+async def _is_google_image_captcha(page: Any) -> bool:
+    try:
+        return bool(
+            await page.evaluate(
+                """() => {
+                    const text = (document.body?.innerText || '').toLowerCase();
+                    if (!text.includes('type the text you hear or see')) return false;
+                    const imgs = document.querySelectorAll('img');
+                    for (const img of imgs) {
+                        const src = (img.src || '').toLowerCase();
+                        const alt = (img.alt || '').toLowerCase();
+                        if (src.includes('captcha') || alt.includes('captcha') ||
+                            (img.width > 80 && img.width < 400 && img.height > 30 && img.height < 200)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+async def _solve_google_image_captcha(page: Any, api_key: str) -> bool:
+    global _captcha_solve_count, _captcha_solve_errors
+    if not api_key:
+        _codebuddy_auth_debug("captcha solver: no API key configured")
+        return False
+
+    try:
+        captcha_b64 = await page.evaluate(
+            """() => {
+                const imgs = document.querySelectorAll('img');
+                for (const img of imgs) {
+                    const src = (img.src || '').toLowerCase();
+                    const alt = (img.alt || '').toLowerCase();
+                    if (src.includes('captcha') || alt.includes('captcha') ||
+                        (img.width > 80 && img.width < 400 && img.height > 30 && img.height < 200 &&
+                         !src.includes('logo') && !src.includes('icon'))) {
+                        const canvas = document.createElement('canvas');
+                        canvas.width = img.naturalWidth || img.width;
+                        canvas.height = img.naturalHeight || img.height;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0);
+                        return canvas.toDataURL('image/png').split(',')[1];
+                    }
+                }
+                return '';
+            }"""
+        )
+
+        if not captcha_b64:
+            _codebuddy_auth_debug("captcha solver: could not extract captcha image via canvas")
+            for selector in CAPTCHA_IMAGE_SELECTORS:
+                try:
+                    el = await page.query_selector(selector)
+                    if el and await el.is_visible():
+                        screenshot_bytes = await el.screenshot()
+                        import base64
+                        captcha_b64 = base64.b64encode(screenshot_bytes).decode()
+                        _codebuddy_auth_debug(
+                            f"captcha solver: got image via screenshot selector={selector}"
+                        )
+                        break
+                except Exception:
+                    continue
+
+        if not captcha_b64:
+            _codebuddy_auth_debug("captcha solver: failed to capture captcha image")
+            _captcha_solve_errors += 1
+            return False
+
+        _codebuddy_auth_debug(
+            f"captcha solver: sending image to 2captcha (len={len(captcha_b64)})"
+        )
+
+        from twocaptcha import TwoCaptcha
+
+        solver = TwoCaptcha(api_key, defaultTimeout=60, pollingInterval=5)
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: solver.normal(captcha_b64, caseSensitive=0, minLen=4, maxLen=12),
+        )
+        answer = (result.get("code") or "").strip()
+        if not answer:
+            _codebuddy_auth_debug("captcha solver: 2captcha returned empty answer")
+            _captcha_solve_errors += 1
+            return False
+
+        _codebuddy_auth_debug(f"captcha solver: answer={answer!r}")
+        _captcha_solve_count += 1
+
+        filled = False
+        for selector in CAPTCHA_INPUT_SELECTORS:
+            try:
+                handle = await page.query_selector(selector)
+                if not handle or not await handle.is_visible():
+                    continue
+                await handle.click(timeout=2000)
+                await handle.press("Control+a")
+                await handle.press("Backspace")
+                await page.keyboard.type(answer, delay=30)
+                filled = True
+                _codebuddy_auth_debug(f"captcha solver: filled input selector={selector}")
+                break
+            except Exception:
+                continue
+
+        if not filled:
+            filled = await _fill_input(page, CAPTCHA_INPUT_SELECTORS, answer)
+
+        if not filled:
+            _codebuddy_auth_debug("captcha solver: could not fill captcha input")
+            _captcha_solve_errors += 1
+            return False
+
+        await asyncio.sleep(0.3)
+        try:
+            clicked = bool(
+                await page.evaluate(
+                    """() => {
+                        const btns = document.querySelectorAll(
+                            'button, div[role="button"], input[type="submit"]'
+                        );
+                        for (const btn of btns) {
+                            const txt = (btn.textContent || btn.value || '').trim().toLowerCase();
+                            if (btn.offsetParent === null) continue;
+                            if (txt.includes('next') || txt.includes('verify') ||
+                                txt.includes('submit') || txt.includes('continue')) {
+                                btn.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }"""
+                )
+            )
+            if not clicked:
+                await page.keyboard.press("Enter")
+        except Exception:
+            await page.keyboard.press("Enter")
+
+        _codebuddy_auth_debug("captcha solver: submitted answer, waiting for navigation")
+        await asyncio.sleep(3.0)
+        return True
+
+    except Exception as exc:
+        _codebuddy_auth_debug(f"captcha solver: error={exc}")
+        _captcha_solve_errors += 1
+        return False
+
+
+def get_codebuddy_captcha_stats() -> dict:
+    return {
+        "solved": _captcha_solve_count,
+        "errors": _captcha_solve_errors,
+    }
 
 
 async def _handle_codebuddy_region_select(page: Any) -> bool:
@@ -2254,9 +2439,27 @@ class CodeBuddyProviderAdapter(ProviderAdapter):
                 except Exception:
                     pass
 
-            # Instant CAPTCHA / challenge detection — skip immediately
             challenge = await _detect_google_blocking_challenge(page)
             if challenge:
+                if await _is_google_image_captcha(page):
+                    captcha_key = CODEBUDDY_CAPTCHA_API_KEY
+                    if not captcha_key:
+                        try:
+                            from unified import database as db
+                            captcha_key = await db.get_setting("captcha_api_key", "")
+                        except Exception:
+                            pass
+                    if captcha_key:
+                        _codebuddy_auth_debug(
+                            f"image captcha detected, attempting solve (challenge={challenge})"
+                        )
+                        solved = await _solve_google_image_captcha(page, captcha_key)
+                        if solved:
+                            await asyncio.sleep(2.0)
+                            continue
+                        _codebuddy_auth_debug("captcha solve failed, will retry loop")
+                        await asyncio.sleep(1.0)
+                        continue
                 raise RetryableBatcherError(
                     ErrorCode.browser_challenge_blocked,
                     f"codebuddy blocked by Google: {challenge}",
@@ -2428,6 +2631,20 @@ class CodeBuddyProviderAdapter(ProviderAdapter):
                 if email_step_started_at is None:
                     email_step_started_at = now
                 elif now - email_step_started_at > 120.0:
+                    if await _is_google_image_captcha(page):
+                        captcha_key = CODEBUDDY_CAPTCHA_API_KEY
+                        if not captcha_key:
+                            try:
+                                from unified import database as db
+                                captcha_key = await db.get_setting("captcha_api_key", "")
+                            except Exception:
+                                pass
+                        if captcha_key:
+                            solved = await _solve_google_image_captcha(page, captcha_key)
+                            if solved:
+                                email_step_started_at = time.monotonic()
+                                await asyncio.sleep(2.0)
+                                continue
                     raise RetryableBatcherError(
                         ErrorCode.browser_challenge_blocked,
                         "codebuddy captcha suspected: email step stuck > 120s",
@@ -2540,7 +2757,33 @@ class CodeBuddyProviderAdapter(ProviderAdapter):
         await _save_cookies_to_file(page, account.identifier)
         _codebuddy_auth_debug("cookies saved, browser can be closed now")
 
-        return {"api_key": api_key, "state": state}
+        # Capture browser cookies for cb_session persistence
+        cb_session_str = ""
+        cb_interaction_str = ""
+        try:
+            raw_cookies = await page.context.cookies([CODEBUDDY_BASE_URL])
+            if raw_cookies:
+                cookie_header = _build_cookie_header_from_dict(raw_cookies)
+                cb_session_str = json.dumps({
+                    "cookies": raw_cookies,
+                    "cookie_header": cookie_header,
+                    "created_at": time.time(),
+                    "expires_at": time.time() + 3600,
+                })
+                cb_interaction_str = json.dumps({
+                    "workspace_id": account.metadata.get("workspace_id", ""),
+                    "user_enterprise_id": user_enterprise_id,
+                    "created_at": time.time(),
+                })
+        except Exception as exc:
+            _codebuddy_auth_debug(f"failed to capture session cookies: {exc}")
+
+        return {
+            "api_key": api_key,
+            "state": state,
+            "cb_session": cb_session_str,
+            "cb_interaction": cb_interaction_str,
+        }
 
     async def fetch_quota(
         self,

@@ -1,0 +1,52 @@
+[
+  {
+    "name": "AUTH_SESSION_ID",
+    "value": "379add2f-be81-4674-8236-a5b9b4ed7716.keycloaky-0-4184",
+    "domain": "www.codebuddy.ai",
+    "path": "/auth/realms/copilot/",
+    "expires": -1,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "KC_RESTART",
+    "value": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0..c-TgsdkbKoKr_kOKQ0O9mA.ULu0paQjcFzN8fV8AWyANecqy29Hw_gaWotPgfuvcgS3JJti7umS5cBy6tjrW81EHT_xt8qa0CW7Mwu1wbOdT6QiPByOjFElkwxbaH_3DCfeyXnuWQ_JwZwwryYyxX0F-WopJOhr8GA7wcYeZMuuGv53hecWIN8GtYkrBVQX76cgYIJPei6_CiCjiePbwGkKF8PTgd-Y1tZSamFAuawsDAGHslgKkxv73898kciYJlRvaDisDZeSmV9zykWH0595ZNFcqDQa313vVzA0SymKLnLXIo-oKwYdFJ-bE7RebYovy2SHVuPaYTMWuL9jPy0ceMumu2kb0EGl4deXA31GWcyRHEu6TDneG_DQrGXvJ7W4TLT5MCD0BkWNROcDW5fyIi9hrguubhWBvD6bx-Wy2WRPvLhHoX0uF4NL_THl8vMHxxTDjE-BKslW7O7ohY6gW9Pbo5VInbUieE1l5JB34RzK_Pm99nQJhP4ouBPW06BO7tRwUNTnw5W9qvrMxVrdKw2joa3jldj4gHNLim7JcxRi-6PdD19JxV-27BoSKmn-MTqgg9Xf5Q_VFlfz5WZRJ5ntn1nLIutuoMLnq_R0FmR-RDdWnOaaa3eNv3_lVKmlHcnWULH38DvzFlSpe7nJ7AwHSr54vA2nkVSXBurRxT5hgmoYGHW_o4Ll_ECIhYYvQleQhXY0vi-j51V6Sn-lm6jfOnp-rQNQMCUQGoo1-uTkIA7aaHpBdrQEaA6ZxR2hwyaUBomXzbYck5JpItlWvSyaXKxc09kUFs6GUwhD5NTs1MAbcgEHa46qieyu1Ik1gPt6DHvGFWRoK8BAkelcZmBfkLuZB8wOPbuNVluI5prkHNqoc3t0fnytmYFvxoM5xA9jQsfty8v7EpcwhCEn5Kw2emFeNxTLEGPA6MRALN_qbfU3EQFoqVGwkIr89CMla8Q5xJ2aL4yN4vRDwGyoIMtFQm_mw7YX0eJXw2M3F54SUo_23WrjJ8Be4Svq9vXR2dI4WVv15lZ4q-eTBO4yiQFTvQ-BY34AFVo6awXPh3cZVJpvVSoFGaUNiMjx-ATYWzgfR8DC129U-WXmiK_u_41N3dFtNK30V2kqgtDKYwz6z5xNGt1kU9hLmspT5whCfk53KdYUZWx7h3ODljg-vXohESgs6MgLOANGr5aQI7DKdd16qIGvtO2Uj1ZTzSY68htx8KekHwVG1uXdF9911esyUKQf1ZnBrftwYADCPuj7YRH5CtMXbADFl5fJIesUIM6TakfIzjXYTVrJv1GJ.Ntp_dD3jlvsyH_radD5SQg",
+    "domain": "www.codebuddy.ai",
+    "path": "/auth/realms/copilot/",
+    "expires": -1,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "__Host-GAPS",
+    "value": "1:8Bk8EhIz06UrFU99Dw-_qfMpICyfUg:X7l4ETVaW1HlVt_M",
+    "domain": "accounts.google.com",
+    "path": "/",
+    "expires": 1815836083,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "OTZ",
+    "value": "8649535_28_28__28_",
+    "domain": "accounts.google.com",
+    "path": "/",
+    "expires": 1783868084,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "NID",
+    "value": "532=sCvfrMwN2gjqrgF4uT_n5lz3vTVuqy6OFvc2Trj1oKCNovmXy9A2b01BgJziVJRom9E2tT8FNEfsEERcW9vcCn413wOEWTnPuoqoVdOEiDebRnDeDP2MlvT5dVsrHyJ8D6pJFTm9T5Mj9n-AXJX7OeoEFRD9z4x74UNySoxuHAQqxXXqwykUHrcRQchp3_nZ-3aY6ug",
+    "domain": ".google.com",
+    "path": "/",
+    "expires": 1797087284,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+  }
+]

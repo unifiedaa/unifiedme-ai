@@ -1421,8 +1421,9 @@ async def start_batch_endpoint(req: BatchLoginRequest, request: Request, _: bool
 
     try:
         count = await start_batch(accounts, providers, headless=req.headless,
-                                  concurrency=max(1, req.concurrency),
-                                  mcp_urls=mcp_urls)
+                                   concurrency=max(1, req.concurrency),
+                                   mcp_urls=mcp_urls,
+                                   gumloop_mode=getattr(req, 'gumloop_mode', 'full'))
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=409)
 

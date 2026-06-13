@@ -75,6 +75,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     cb_error_count      INTEGER DEFAULT 0,
     last_used_cb        TEXT DEFAULT '',
     cb_expires_at       TEXT DEFAULT '',
+    cb_session          TEXT DEFAULT '',  -- JSON: browser cookies + headers
+    cb_interaction      TEXT DEFAULT '',  -- JSON: last interaction details
 
     -- WaveSpeed fields
     ws_status           TEXT DEFAULT 'none',  -- none, pending, ok, failed, exhausted
@@ -349,6 +351,9 @@ async def _run_migrations(conn: aiosqlite.Connection) -> None:
         "ALTER TABLE accounts ADD COLUMN last_used_windsurf TEXT DEFAULT ''",
         "ALTER TABLE accounts ADD COLUMN windsurf_verified INTEGER DEFAULT 0",
         "ALTER TABLE accounts ADD COLUMN windsurf_test_error TEXT DEFAULT ''",
+        # CodeBuddy session/interaction persistence
+        "ALTER TABLE accounts ADD COLUMN cb_session TEXT DEFAULT ''",
+        "ALTER TABLE accounts ADD COLUMN cb_interaction TEXT DEFAULT ''",
         # TheRouter fields
         "ALTER TABLE accounts ADD COLUMN tr_status TEXT DEFAULT 'none'",
         "ALTER TABLE accounts ADD COLUMN tr_api_key TEXT DEFAULT ''",

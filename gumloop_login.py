@@ -625,15 +625,21 @@ async def _single_login_attempt(page, email: str, password: str) -> tuple:
 
 
 async def run_login(email: str, password: str) -> dict:
-    from app.browser import create_stealth_browser
+    from browserforge.fingerprints import Screen
+    from camoufox.async_api import AsyncCamoufox
 
     emit({"type": "progress", "provider": "gumloop", "step": "init", "message": "Launching browser..."})
 
-    manager, browser, page = await create_stealth_browser(
+    manager = AsyncCamoufox(
         headless=os.getenv("BATCHER_CAMOUFOX_HEADLESS", "true").lower() == "true",
-        timeout=20000,
-        humanize=True,
+        os="windows",
+        block_webrtc=True,
+        humanize=False,
+        screen=Screen(max_width=1920, max_height=1080),
     )
+    browser = await manager.__aenter__()
+    page = await browser.new_page()
+    page.set_default_timeout(20000)
 
     MAX_LOGIN_ATTEMPTS = 3
     last_error = "Unknown error"

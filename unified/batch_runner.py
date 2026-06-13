@@ -20,6 +20,8 @@ from .config import (
     AUTH_SCRIPT,
     WAVESPEED_SCRIPT,
     GUMLOOP_SCRIPT,
+    GUMLOOP_RELOGIN_SCRIPT,
+    CB_INTERCEPT_SCRIPT,
     CHATBAI_SCRIPT,
     PYTHON_BIN,
     KIRO_UPSTREAM,
@@ -68,6 +70,7 @@ class BatchState:
         self.cancelled: bool = False
         self.headless: bool = True
         self.concurrency: int = 1
+        self.gumloop_mode: str = "full"
         self._sse_queues: list[asyncio.Queue] = []
         self._lock = asyncio.Lock()
         self._active_procs: list[asyncio.subprocess.Process] = []  # track running subprocesses
@@ -124,7 +127,8 @@ async def _check_global_duplicates(emails: list[str], providers: list[str]) -> d
 
 async def start_batch(accounts: list[tuple[str, str]], providers: list[str],
                       headless: bool = True, concurrency: int = 1,
-                      mcp_urls: list[str] | None = None) -> int:
+                      mcp_urls: list[str] | None = None,
+                      gumloop_mode: str = "full") -> int:
     """Start a batch login. Returns number of jobs queued.
 
     accounts: list of (email, password) tuples
@@ -139,6 +143,7 @@ async def start_batch(accounts: list[tuple[str, str]], providers: list[str],
     batch_state.cancelled = False
     batch_state.headless = headless
     batch_state.concurrency = max(1, concurrency)
+    batch_state.gumloop_mode = gumloop_mode if gumloop_mode in ("relogin", "full") else "full"
     batch_state._active_procs.clear()
 
     # ── Global duplicate check via D1 (cross-license) ──
@@ -236,9 +241,13 @@ async def _run_single_job(job: AccountJob, index: int, proxy_info: dict | None) 
         if proxy_url_used:
             job._assigned_proxy = proxy_url_used  # type: ignore
 
-        kiro_cb_providers = [p for p in job.providers if p in ("kiro", "codebuddy")]
-        if kiro_cb_providers:
-            result, _ = await _run_login(job, proxy_override=proxy_url_used or None)
+        if "kiro" in job.providers:
+            kiro_result, _ = await _run_login(job, proxy_override=proxy_url_used or None)
+            result.update(kiro_result)
+
+        if "codebuddy" in job.providers:
+            cb_result, _ = await _run_codebuddy_intercept(job, proxy_override=proxy_url_used or None)
+            result.update(cb_result)
 
         if "wavespeed" in job.providers:
             ws_result, _ = await _run_wavespeed_login(job, proxy_override=proxy_url_used or None)
@@ -628,15 +637,9 @@ async def _run_login(job: AccountJob, proxy_override: str | None = None) -> tupl
         "BATCHER_CODEBUDDY_AUTH_DEBUG": "true",
     }
 
-    if set(job.providers) == {"kiro"}:
-        env["BATCHER_CONCURRENT"] = "1"
-        env["BATCHER_PRIORITY"] = "standard"
-    elif set(job.providers) == {"codebuddy"}:
-        env["BATCHER_CONCURRENT"] = "1"
-        env["BATCHER_PRIORITY"] = "max"
-    else:
-        env["BATCHER_CONCURRENT"] = "2"
-        env["BATCHER_PRIORITY"] = "standard"
+    # CodeBuddy now uses _run_codebuddy_intercept; this function is kiro-only
+    env["BATCHER_CONCURRENT"] = "1"
+    env["BATCHER_PRIORITY"] = "standard"
 
     # Use assigned proxy (from concurrent worker) or fallback to pool rotation
     proxy_url_used = ""
@@ -710,6 +713,7 @@ async def _run_login(job: AccountJob, proxy_override: str | None = None) -> tupl
     # Timeout: kill subprocess if it takes too long (3 minutes per job)
     JOB_TIMEOUT = 180
     try:
+        assert proc.stdout is not None and proc.stderr is not None
         await asyncio.wait_for(
             asyncio.gather(
                 read_stream(proc.stdout, False),
@@ -747,7 +751,7 @@ async def _run_login(job: AccountJob, proxy_override: str | None = None) -> tupl
 
 async def _import_kiro(job: AccountJob) -> bool:
     """Import Kiro tokens directly into DB (no more Kiro-Go binary)."""
-    creds = job.result.get("kiro", {}).get("credentials", {})
+    creds = (job.result or {}).get("kiro", {}).get("credentials", {})
     if not creds.get("access_token"):
         return False
 
@@ -766,7 +770,7 @@ async def _import_kiro(job: AccountJob) -> bool:
                 kiro_expires_at = (datetime.utcnow() + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
 
             # Store Kiro credits from quota if available
-            quota = job.result.get("kiro", {}).get("quota") or {}
+            quota = (job.result or {}).get("kiro", {}).get("quota") or {}
             kiro_credits = float(quota.get("remaining", 0) or quota.get("remaining_credits", 0) or 550.0)
             kiro_credits_total = float(quota.get("total_credits", 0) or quota.get("limit", 0) or 550.0)
             kiro_credits_used = float(quota.get("total_usage", 0) or quota.get("current_usage", 0) or 0)
@@ -804,13 +808,15 @@ async def _import_kiro(job: AccountJob) -> bool:
 
 async def _import_codebuddy(job: AccountJob) -> bool:
     """Store CodeBuddy API key in DB."""
-    creds = job.result.get("codebuddy", {}).get("credentials", {})
+    creds = (job.result or {}).get("codebuddy", {}).get("credentials", {})
     api_key = creds.get("api_key", "")
     if not api_key:
         return False
 
     try:
         if job.account_id:
+            cb_session = creds.get("cb_session", "")
+            cb_interaction = creds.get("cb_interaction", "")
             # CodeBuddy keys expire 2 weeks after creation
             cb_expires_at = (datetime.utcnow() + timedelta(days=14)).strftime("%Y-%m-%d %H:%M:%S")
             await db.update_account(
@@ -821,6 +827,8 @@ async def _import_codebuddy(job: AccountJob) -> bool:
                 cb_error="",
                 cb_error_count=0,
                 cb_expires_at=cb_expires_at,
+                cb_session=cb_session,
+                cb_interaction=cb_interaction,
             )
         batch_state.broadcast({
             "type": "import_ok",
@@ -837,6 +845,110 @@ async def _import_codebuddy(job: AccountJob) -> bool:
             "error": str(exc),
         })
         return False
+
+
+async def _run_codebuddy_intercept(job: AccountJob, proxy_override: str | None = None) -> tuple[dict, str]:
+    """Run cb_login_intercept.py — async Camoufox + trial activation flow.
+
+    Returns (result_data, proxy_url_used).
+    """
+    proxy_url_used = proxy_override or ""
+    if not proxy_url_used:
+        proxy_info = await db.get_proxy_for_batch()
+        if proxy_info:
+            proxy_url_used = proxy_info["url"]
+
+    env = {
+        **os.environ,
+        "BATCHER_CAMOUFOX_HEADLESS": "true" if batch_state.headless else "false",
+        "BATCHER_CAPTCHA_API_KEY": os.getenv("BATCHER_CAPTCHA_API_KEY", "5ff220e19373d967a494cf020fe454b7"),
+    }
+    python_bin = str(PYTHON_BIN)
+    cb_script = str(CB_INTERCEPT_SCRIPT)
+
+    if not os.path.exists(cb_script):
+        log.error("CB intercept script not found: %s", cb_script)
+        return {"codebuddy": {"success": False, "error": f"Script not found: {cb_script}"}}, ""
+
+    proc = await asyncio.create_subprocess_exec(
+        python_bin,
+        cb_script,
+        "--email", job.email,
+        "--password", job.password,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    batch_state._active_procs.append(proc)
+
+    result_data: dict = {}
+
+    async def read_stream(stream: asyncio.StreamReader, is_stderr: bool = False) -> None:
+        nonlocal result_data
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").strip()
+            if not text:
+                continue
+
+            try:
+                parsed = json.loads(text)
+                if parsed.get("type") == "result":
+                    result_data = parsed
+
+                batch_state.broadcast({
+                    "type": "job_log",
+                    "job_id": job.id,
+                    "email": job.email,
+                    "log_type": parsed.get("type", "info"),
+                    "provider": parsed.get("provider", "codebuddy"),
+                    "step": parsed.get("step", ""),
+                    "message": parsed.get("message", text),
+                    "proxy_used": proxy_url_used,
+                })
+            except json.JSONDecodeError:
+                log_type = "stderr" if is_stderr else "stdout"
+                batch_state.broadcast({
+                    "type": "job_log",
+                    "job_id": job.id,
+                    "email": job.email,
+                    "log_type": log_type,
+                    "message": text,
+                    "proxy_used": proxy_url_used,
+                })
+
+    JOB_TIMEOUT = 300
+    try:
+        assert proc.stdout is not None and proc.stderr is not None
+        await asyncio.wait_for(
+            asyncio.gather(
+                read_stream(proc.stdout, False),
+                read_stream(proc.stderr, True),
+            ),
+            timeout=JOB_TIMEOUT,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=10)
+    except asyncio.TimeoutError:
+        log.warning("CB intercept %s timed out after %ds", job.email, JOB_TIMEOUT)
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+        batch_state.broadcast({
+            "type": "job_log", "job_id": job.id, "email": job.email,
+            "log_type": "stderr", "message": f"CB intercept timed out after {JOB_TIMEOUT}s",
+            "proxy_used": proxy_url_used,
+        })
+        if not result_data:
+            result_data = {"codebuddy": {"success": False, "error": f"Timeout after {JOB_TIMEOUT}s"}}
+    finally:
+        if proc in batch_state._active_procs:
+            batch_state._active_procs.remove(proc)
+
+    return result_data, proxy_url_used
 
 
 async def _run_wavespeed_login(job: AccountJob, proxy_override: str | None = None) -> tuple[dict, str]:
@@ -914,6 +1026,7 @@ async def _run_wavespeed_login(job: AccountJob, proxy_override: str | None = Non
     # Timeout: kill subprocess if it takes too long (3 minutes per job)
     WS_TIMEOUT = 180
     try:
+        assert proc.stdout is not None and proc.stderr is not None
         await asyncio.wait_for(
             asyncio.gather(
                 read_stream(proc.stdout, False),
@@ -945,7 +1058,7 @@ async def _run_wavespeed_login(job: AccountJob, proxy_override: str | None = Non
 
 async def _import_wavespeed(job: AccountJob) -> bool:
     """Store WaveSpeed API key in DB with $1 default credits."""
-    ws_data = job.result.get("wavespeed", {})
+    ws_data = (job.result or {}).get("wavespeed", {})
     api_key = ws_data.get("api_key", "")
     if not api_key:
         return False
@@ -1043,6 +1156,7 @@ async def _run_chatbai_login(job: AccountJob, proxy_override: str | None = None)
                 if is_stderr:
                     log.debug("[chatbai stderr] %s", text[:200])
 
+    assert proc.stdout is not None and proc.stderr is not None
     await asyncio.gather(
         read_stream(proc.stdout, is_stderr=False),
         read_stream(proc.stderr, is_stderr=True),
@@ -1060,7 +1174,7 @@ async def _run_chatbai_login(job: AccountJob, proxy_override: str | None = None)
 
 async def _import_chatbai(job: AccountJob) -> bool:
     """Store ChatBAI API key in DB with default credits."""
-    cbai_data = job.result.get("chatbai", {})
+    cbai_data = (job.result or {}).get("chatbai", {})
     api_key = cbai_data.get("api_key", "")
     session_token = cbai_data.get("session_token", "")
 
@@ -1121,59 +1235,72 @@ async def _run_gumloop_login(
         if proxy_info:
             proxy_url_used = proxy_info["url"]
 
-    # Fast path: if account already has refresh_token, just refresh it (no browser needed)
-    account = await db.get_account(job.account_id) if job.account_id else None
-    if account and account.get("gl_refresh_token"):
-        refresh_token = account["gl_refresh_token"]
-        user_id = account.get("gl_user_id", "")
+    env = {**os.environ, "BATCHER_CAMOUFOX_HEADLESS": "true" if batch_state.headless else "false"}
+    python_bin = str(PYTHON_BIN)
+    gl_timeout = 600
+    gl_extra_args: list[str] = []
 
+    if batch_state.gumloop_mode == "relogin":
+        gl_script = str(GUMLOOP_RELOGIN_SCRIPT)
+        gl_timeout = 240
         batch_state.broadcast({
             "type": "job_log", "job_id": job.id, "email": job.email,
             "log_type": "info", "provider": "gumloop",
-            "step": "refresh", "message": "Refreshing Firebase token (existing account)...",
+            "step": "login", "message": "Relogin mode: browser Google OAuth → token extraction only",
             "proxy_used": proxy_url_used,
         })
-
-        try:
-            auth = GumloopAuth(
-                refresh_token=refresh_token,
-                user_id=user_id,
-                proxy_url=proxy_url_used or None,
-            )
-            token = await auth.get_token()
-            updated = auth.get_updated_tokens()
+    else:
+        account = await db.get_account(job.account_id) if job.account_id else None
+        if account and account.get("gl_refresh_token"):
+            refresh_token = account["gl_refresh_token"]
+            user_id = account.get("gl_user_id", "")
 
             batch_state.broadcast({
                 "type": "job_log", "job_id": job.id, "email": job.email,
                 "log_type": "info", "provider": "gumloop",
-                "step": "refresh", "message": "Token refreshed OK",
+                "step": "refresh", "message": "Refreshing Firebase token (existing account)...",
                 "proxy_used": proxy_url_used,
             })
 
-            return {
-                "gumloop": {
-                    "success": True,
-                    "credentials": {
-                        "id_token": token,
-                        "refresh_token": updated.get("gl_refresh_token", refresh_token),
-                        "user_id": updated.get("gl_user_id", user_id) or auth.user_id,
-                        "gummie_id": account.get("gl_gummie_id", ""),
-                    },
-                }
-            }, proxy_url_used
-        except Exception as e:
-            batch_state.broadcast({
-                "type": "job_log", "job_id": job.id, "email": job.email,
-                "log_type": "error", "provider": "gumloop",
-                "step": "refresh", "message": f"Token refresh failed: {e}, falling back to browser signup",
-                "proxy_used": proxy_url_used,
-            })
-            # Fall through to browser signup
+            try:
+                auth = GumloopAuth(
+                    refresh_token=refresh_token,
+                    user_id=user_id,
+                    proxy_url=proxy_url_used or None,
+                )
+                token = await auth.get_token()
+                updated = auth.get_updated_tokens()
 
-    # Browser signup path: run intercept_gumloop_university.py as subprocess
-    env = {**os.environ, "BATCHER_CAMOUFOX_HEADLESS": "true" if batch_state.headless else "false"}
-    python_bin = str(PYTHON_BIN)
-    gl_script = str(GUMLOOP_SCRIPT)
+                batch_state.broadcast({
+                    "type": "job_log", "job_id": job.id, "email": job.email,
+                    "log_type": "info", "provider": "gumloop",
+                    "step": "refresh", "message": "Token refreshed OK",
+                    "proxy_used": proxy_url_used,
+                })
+
+                return {
+                    "gumloop": {
+                        "success": True,
+                        "credentials": {
+                            "id_token": token,
+                            "refresh_token": updated.get("gl_refresh_token", refresh_token),
+                            "user_id": updated.get("gl_user_id", user_id) or auth.user_id,
+                            "gummie_id": account.get("gl_gummie_id", ""),
+                        },
+                    }
+                }, proxy_url_used
+            except Exception as e:
+                batch_state.broadcast({
+                    "type": "job_log", "job_id": job.id, "email": job.email,
+                    "log_type": "error", "provider": "gumloop",
+                    "step": "refresh", "message": f"Token refresh failed: {e}, falling back to browser signup",
+                    "proxy_used": proxy_url_used,
+                })
+
+        gl_script = str(GUMLOOP_SCRIPT)
+        if job.mcp_urls:
+            gl_extra_args.extend(["--mcp-url", job.mcp_urls[0]])
+        gl_extra_args.extend(["--answers", "2,1,3,2,1,3"])
 
     log.info("GL script path: %s (exists=%s)", gl_script, os.path.exists(gl_script))
     batch_state.broadcast({
@@ -1187,14 +1314,7 @@ async def _run_gumloop_login(
         log.error("Gumloop script not found: %s", gl_script)
         return {"gumloop": {"success": False, "error": f"Script not found: {gl_script}"}}, ""
 
-    cmd_args = [python_bin, gl_script, "--email", job.email, "--password", job.password]
-
-    # Pass MCP URL so the script creates + attaches MCP during browser session
-    if job.mcp_urls:
-        cmd_args.extend(["--mcp-url", job.mcp_urls[0]])
-
-    # Pass default answers so university quizzes don't block on input()
-    cmd_args.extend(["--answers", "2,1,3,2,1,3"])
+    cmd_args = [python_bin, gl_script, "--email", job.email, "--password", job.password, *gl_extra_args]
 
     log.info("GL cmd_args: %s", " ".join(cmd_args))
 
@@ -1238,18 +1358,18 @@ async def _run_gumloop_login(
                 })
             job.logs.append({"ts": time.time(), "raw": text})
 
-    GL_TIMEOUT = 600  # 10 min — includes university flow (login + MCP + 2 courses + quizzes)
     try:
+        assert proc.stdout is not None and proc.stderr is not None
         await asyncio.wait_for(
             asyncio.gather(
                 read_stream(proc.stdout, False),
                 read_stream(proc.stderr, True),
             ),
-            timeout=GL_TIMEOUT,
+            timeout=gl_timeout,
         )
         await asyncio.wait_for(proc.wait(), timeout=10)
     except asyncio.TimeoutError:
-        log.warning("Job %s gumloop timed out after %ds, killing process", job.email, GL_TIMEOUT)
+        log.warning("Job %s gumloop timed out after %ds, killing process", job.email, gl_timeout)
         try:
             proc.kill()
             await proc.wait()
@@ -1257,11 +1377,11 @@ async def _run_gumloop_login(
             pass
         batch_state.broadcast({
             "type": "job_log", "job_id": job.id, "email": job.email,
-            "log_type": "stderr", "message": f"Gumloop login timed out after {GL_TIMEOUT}s",
+            "log_type": "stderr", "message": f"Gumloop login timed out after {gl_timeout}s",
             "proxy_used": proxy_url_used,
         })
         if "gumloop" not in result_data:
-            result_data["gumloop"] = {"success": False, "error": f"Timed out after {GL_TIMEOUT}s"}
+            result_data["gumloop"] = {"success": False, "error": f"Timed out after {gl_timeout}s"}
     finally:
         if proc in batch_state._active_procs:
             batch_state._active_procs.remove(proc)
@@ -1322,10 +1442,12 @@ async def _run_skillboss_login(job: AccountJob) -> dict:
 
     # Stream stdout line-by-line for real-time progress
     result_data: dict = {"skillboss": {"success": False, "error": "No result"}}
+    assert proc.stdout is not None and proc.stderr is not None
+    _stdout = proc.stdout
     try:
         async def _read_lines():
             while True:
-                line = await asyncio.wait_for(proc.stdout.readline(), timeout=180)
+                line = await asyncio.wait_for(_stdout.readline(), timeout=180)
                 if not line:
                     break
                 yield line.decode(errors="replace").strip()
@@ -1482,10 +1604,12 @@ async def _run_windsurf_login(job: AccountJob, proxy_override: str | None = None
 
         # Stream stdout for real-time progress
         result = {"success": False, "error": "No result"}
+        assert proc.stdout is not None and proc.stderr is not None
+        _stdout = proc.stdout
         try:
             async def _read_lines():
                 while True:
-                    line = await asyncio.wait_for(proc.stdout.readline(), timeout=180)
+                    line = await asyncio.wait_for(_stdout.readline(), timeout=180)
                     if not line:
                         break
                     yield line.decode(errors="replace").strip()
@@ -1559,7 +1683,7 @@ async def _run_windsurf_login(job: AccountJob, proxy_override: str | None = None
 
 async def _import_gumloop(job: AccountJob) -> bool:
     """Store Gumloop tokens in DB (from browser signup or token refresh)."""
-    gl_data = job.result.get("gumloop", {})
+    gl_data = (job.result or {}).get("gumloop", {})
     creds = gl_data.get("credentials", {})
     if not creds.get("id_token") and not creds.get("refresh_token"):
         return False
@@ -1722,11 +1846,11 @@ async def attach_mcp_to_account(
         log.info("[MCP attach] %s: %s", account.get("email", "?"), msg)
 
     try:
-        client_kwargs = {"timeout": 60}
+        client_kwargs: dict[str, object] = {"timeout": 60}
         if proxy_url:
             client_kwargs["proxy"] = proxy_url
 
-        async with httpx.AsyncClient(**client_kwargs) as client:
+        async with httpx.AsyncClient(**client_kwargs) as client:  # type: ignore[arg-type]
             # Get existing MCP secrets
             resp = await client.get(f"{_MCP_API_BASE}//secrets/mcp_servers", headers=headers)
             existing_secrets = resp.json() if resp.status_code == 200 else []
@@ -1852,10 +1976,13 @@ async def retry_account(account_id: int, providers: Optional[list[str]] = None) 
 
     result: dict = {}
 
-    # Run Kiro/CodeBuddy login if needed
-    kiro_cb_providers = [p for p in providers if p in ("kiro", "codebuddy")]
-    if kiro_cb_providers:
-        result, _proxy = await _run_login(job)
+    if "kiro" in providers:
+        kiro_result, _proxy = await _run_login(job)
+        result.update(kiro_result)
+
+    if "codebuddy" in providers:
+        cb_result, _proxy = await _run_codebuddy_intercept(job)
+        result.update(cb_result)
 
     # Run WaveSpeed login separately if needed
     if "wavespeed" in providers:
