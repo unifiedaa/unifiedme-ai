@@ -1288,26 +1288,33 @@ async def regenerate_key(key_id: int, request: Request, _: bool = Depends(verify
 
 @router.get("/settings/captcha")
 async def get_captcha_settings(_: bool = Depends(verify_admin)):
-    """Get captcha API key (masked) and stats."""
     key = await db.get_setting("captcha_api_key", "")
+    provider = await db.get_setting("captcha_provider", "auto")
+    from .solver_manager import solver_manager
     from .proxy_gumloop import get_captcha_stats
     stats = get_captcha_stats()
     return {
+        "provider": provider,
         "has_key": bool(key),
         "key_preview": key[:6] + "***" + key[-4:] if len(key) > 10 else ("***" if key else ""),
-        **stats,
+        "solver_status": {
+            "running": solver_manager.is_running(),
+            "pid": solver_manager._pid or solver_manager._read_pid_file(),
+            "port": solver_manager.PORT,
+            "available": solver_manager.is_available(),
+        },
+        "solved": stats.get("solved", 0),
+        "errors": stats.get("errors", 0),
     }
 
 
 @router.post("/settings/captcha")
 async def set_captcha_settings(request: Request, _: bool = Depends(verify_admin)):
-    """Set captcha API key. Body: {api_key: str}."""
     body = await request.json()
     api_key = str(body.get("api_key", "")).strip()
     if not api_key:
         return JSONResponse({"error": "api_key required"}, status_code=400)
     await db.set_setting("captcha_api_key", api_key)
-    # Update the live turnstile solver
     from .proxy_gumloop import _get_turnstile
     ts = _get_turnstile()
     ts.update_api_key(api_key)
@@ -1316,12 +1323,102 @@ async def set_captcha_settings(request: Request, _: bool = Depends(verify_admin)
 
 @router.delete("/settings/captcha")
 async def clear_captcha_settings(_: bool = Depends(verify_admin)):
-    """Clear captcha API key."""
     await db.set_setting("captcha_api_key", "")
     from .proxy_gumloop import _get_turnstile
     ts = _get_turnstile()
     ts.update_api_key("")
     return {"ok": True}
+
+
+@router.post("/settings/captcha/provider")
+async def set_captcha_provider(request: Request, _: bool = Depends(verify_admin)):
+    body = await request.json()
+    provider = str(body.get("provider", "auto")).strip()
+    if provider not in ("auto", "selfhost", "2captcha"):
+        return JSONResponse({"error": "Invalid provider"}, status_code=400)
+    await db.set_setting("captcha_provider", provider)
+    from .proxy_gumloop import _get_turnstile
+    ts = _get_turnstile()
+    ts.update_provider(provider)
+    return {"ok": True, "provider": provider}
+
+
+@router.get("/settings/captcha/solver/status")
+async def get_solver_status(_: bool = Depends(verify_admin)):
+    from .solver_manager import solver_manager
+    proxy = await db.get_setting("captcha_solver_proxy", "")
+    return {
+        "running": solver_manager.is_running(),
+        "pid": solver_manager._pid or solver_manager._read_pid_file(),
+        "port": solver_manager.PORT,
+        "available": solver_manager.is_available(),
+        "proxy": proxy,
+    }
+
+
+@router.post("/settings/captcha/solver/start")
+async def start_solver(_: bool = Depends(verify_admin)):
+    from .solver_manager import solver_manager
+    if not solver_manager.is_available():
+        return JSONResponse({"error": "Solver deps not installed (camoufox, quart)"}, status_code=400)
+    ok = await solver_manager.start()
+    if not ok:
+        return JSONResponse({"error": "Solver failed to start"}, status_code=500)
+    return {"ok": True, "running": True, "pid": solver_manager._pid, "port": solver_manager.PORT}
+
+
+@router.post("/settings/captcha/solver/stop")
+async def stop_solver(_: bool = Depends(verify_admin)):
+    from .solver_manager import solver_manager
+    await solver_manager.stop()
+    return {"ok": True, "running": False}
+
+
+@router.post("/settings/captcha/solver/proxy")
+async def set_solver_proxy(request: Request, _: bool = Depends(verify_admin)):
+    body = await request.json()
+    proxy = str(body.get("proxy", "")).strip()
+    await db.set_setting("captcha_solver_proxy", proxy)
+    from .config import DATA_DIR
+    proxy_file = DATA_DIR / "solver_proxy.txt"
+    proxy_file.parent.mkdir(parents=True, exist_ok=True)
+    proxy_file.write_text(proxy, encoding="utf-8")
+    return {"ok": True, "proxy": proxy}
+
+
+@router.get("/captcha/solves")
+async def get_captcha_solves(_: bool = Depends(verify_admin)):
+    from .proxy_gumloop import _get_turnstile
+    ts = _get_turnstile()
+    history = list(reversed(ts.solve_history))
+    return {"solves": history, "count": len(history)}
+
+
+@router.get("/captcha/solves/stream")
+async def stream_captcha_solves(request: Request, _: bool = Depends(verify_admin)):
+    from .proxy_gumloop import _get_turnstile
+    ts = _get_turnstile()
+    queue = ts.subscribe_sse()
+
+    async def event_generator():
+        try:
+            yield "data: {\"event\":\"connected\"}\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30)
+                    yield f"data: {json.dumps(event)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            ts.unsubscribe_sse(queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/stats")
@@ -2646,6 +2743,50 @@ async def set_mcp_apikey(request: Request, _: bool = Depends(verify_admin)):
     return {"ok": True, "message": "API key saved. Restart MCP servers to apply."}
 
 
+@router.get("/mcp/workspaces")
+async def get_mcp_workspaces(_: bool = Depends(verify_admin)):
+    """Get the list of allowed MCP workspace paths."""
+    ws_file = _Path(__file__).resolve().parent / "data" / ".mcp_workspaces"
+    paths = []
+    if ws_file.exists():
+        lines = ws_file.read_text(encoding="utf-8").strip().splitlines()
+        paths = [l.strip() for l in lines if l.strip() and not l.strip().startswith("#")]
+    return {"workspaces": paths}
+
+
+@router.post("/mcp/workspaces")
+async def set_mcp_workspaces(request: Request, _: bool = Depends(verify_admin)):
+    body = await request.json()
+    ws_file = _Path(__file__).resolve().parent / "data" / ".mcp_workspaces"
+    ws_file.parent.mkdir(parents=True, exist_ok=True)
+
+    existing = []
+    if ws_file.exists():
+        existing = [l.strip() for l in ws_file.read_text(encoding="utf-8").strip().splitlines() if l.strip() and not l.strip().startswith("#")]
+
+    action = body.get("action")
+    if action == "add":
+        p = str(body.get("path", "")).strip()
+        if not p:
+            return JSONResponse({"error": "path is required"}, status_code=400)
+        if p not in existing:
+            existing.append(p)
+        ws_file.write_text("\n".join(existing) + "\n", encoding="utf-8")
+        return {"ok": True, "workspaces": existing}
+    elif action == "remove":
+        p = str(body.get("path", "")).strip()
+        existing = [x for x in existing if x != p]
+        ws_file.write_text("\n".join(existing) + "\n", encoding="utf-8")
+        return {"ok": True, "workspaces": existing}
+    else:
+        paths = body.get("workspaces", [])
+        if not isinstance(paths, list):
+            return JSONResponse({"error": "workspaces must be a list of path strings"}, status_code=400)
+        cleaned = [str(p).strip() for p in paths if str(p).strip()]
+        ws_file.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
+        return {"ok": True, "workspaces": cleaned}
+
+
 @router.get("/mcp/instances")
 async def list_mcp_instances(_: bool = Depends(verify_admin)):
     """List all MCP server instances with live status check."""
@@ -2906,4 +3047,81 @@ def _kill_pid_safe(pid: int):
             os.kill(pid, 9)
     except Exception:
         pass
+
+
+# ─── Named Tunnel (persistent URL via cloudflared) ───────────────────────────
+
+_NAMED_TUNNEL_STATE = _Path(__file__).resolve().parent / "data" / ".named_tunnel_state.json"
+_NAMED_TUNNEL_NAME = "unifiedme-mcp"
+_NAMED_TUNNEL_PORT = 9876
+
+
+def _named_tunnel_state() -> dict:
+    if _NAMED_TUNNEL_STATE.exists():
+        try:
+            return json.loads(_NAMED_TUNNEL_STATE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_named_tunnel_state(data: dict):
+    _NAMED_TUNNEL_STATE.parent.mkdir(parents=True, exist_ok=True)
+    _NAMED_TUNNEL_STATE.write_text(json.dumps(data))
+
+
+@router.get("/mcp/named-tunnel/status")
+async def named_tunnel_status(_: bool = Depends(verify_admin)):
+    state = _named_tunnel_state()
+    pid = state.get("pid", 0)
+    if pid and _pid_alive(pid):
+        return {"running": True, "pid": pid, "port": state.get("port", _NAMED_TUNNEL_PORT)}
+    if pid:
+        _save_named_tunnel_state({})
+    return {"running": False}
+
+
+@router.post("/mcp/named-tunnel/start")
+async def named_tunnel_start(_: bool = Depends(verify_admin)):
+    import subprocess as _sp
+    import shutil
+
+    state = _named_tunnel_state()
+    pid = state.get("pid", 0)
+    if pid and _pid_alive(pid):
+        return {"ok": True, "message": "Already running", "pid": pid}
+
+    cf_path = shutil.which("cloudflared")
+    if not cf_path:
+        return JSONResponse({"ok": False, "error": "cloudflared not found in PATH"}, status_code=500)
+
+    cmd = [cf_path, "tunnel", "run", _NAMED_TUNNEL_NAME]
+
+    try:
+        if os.name == "nt":
+            proc = _sp.Popen(cmd, stdout=_sp.DEVNULL, stderr=_sp.PIPE, creationflags=_sp.CREATE_NO_WINDOW)
+        else:
+            proc = _sp.Popen(cmd, stdout=_sp.DEVNULL, stderr=_sp.PIPE, start_new_session=True)
+
+        await asyncio.sleep(3)
+
+        if proc.poll() is not None:
+            stderr_out = proc.stderr.read().decode("utf-8", errors="replace")[:500] if proc.stderr else ""
+            return JSONResponse({"ok": False, "error": f"Tunnel exited immediately: {stderr_out}"}, status_code=500)
+
+        _save_named_tunnel_state({"pid": proc.pid, "port": _NAMED_TUNNEL_PORT})
+        return {"ok": True, "pid": proc.pid, "port": _NAMED_TUNNEL_PORT}
+
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@router.post("/mcp/named-tunnel/stop")
+async def named_tunnel_stop(_: bool = Depends(verify_admin)):
+    state = _named_tunnel_state()
+    pid = state.get("pid", 0)
+    if pid and _pid_alive(pid):
+        _kill_pid_safe(pid)
+    _save_named_tunnel_state({})
+    return {"ok": True}
 

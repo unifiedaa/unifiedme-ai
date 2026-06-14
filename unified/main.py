@@ -133,7 +133,7 @@ def _prompt_license() -> str:
         return key
 
 
-def _validate_license_sync(key: str) -> dict:
+def _validate_license_sync(key: str) -> dict[str, object]:
     """Validate license against central API (synchronous wrapper)."""
     import httpx
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -161,6 +161,18 @@ def _validate_license_sync(key: str) -> dict:
         return {"error": f"Cannot reach license server: {e}"}
 
 
+def _license_result_parts(result: dict[str, object]) -> tuple[bool, dict[str, object], str, bool, str]:
+    ok = bool(result.get("ok"))
+    license_obj = result.get("license")
+    license_data = license_obj if isinstance(license_obj, dict) else {}
+    device_id_obj = result.get("device_id")
+    device_id = device_id_obj if isinstance(device_id_obj, str) and device_id_obj else "?"
+    is_new = bool(result.get("is_new"))
+    error_obj = result.get("error")
+    error = error_obj if isinstance(error_obj, str) and error_obj else "Unknown error"
+    return ok, license_data, device_id, is_new, error
+
+
 def cli_license_flow() -> str:
     """Run the CLI license flow. Returns validated license key or exits."""
     _print_banner()
@@ -171,23 +183,23 @@ def cli_license_flow() -> str:
         print(f"  License: {key}")
         print("  Validating...", end=" ", flush=True)
         result = _validate_license_sync(key)
+        ok, lic, device_id, is_new, error = _license_result_parts(result)
 
-        if result.get("ok"):
+        if ok:
             print("OK")
-            lic = result.get("license", {})
             print()
             print(f"  Owner:        {lic.get('owner_name', '?')}")
             print(f"  Tier:         {lic.get('tier', '?')}")
             print(f"  Max Devices:  {lic.get('max_devices', '?')}")
             print(f"  Max Accounts: {lic.get('max_accounts', '?')}")
-            print(f"  Device ID:    {result.get('device_id', '?')}")
-            if result.get("is_new"):
+            print(f"  Device ID:    {device_id}")
+            if is_new:
                 print("  Status:       NEW device bound")
             print()
             return key
         else:
             print("FAILED")
-            print(f"  Error: {result.get('error', 'Unknown error')}")
+            print(f"  Error: {error}")
             print()
             # Saved key is invalid — clear it and prompt
             if LICENSE_FILE.exists():
@@ -200,17 +212,17 @@ def cli_license_flow() -> str:
         key = _prompt_license()
         print("  Validating...", end=" ", flush=True)
         result = _validate_license_sync(key)
+        ok, lic, device_id, is_new, error = _license_result_parts(result)
 
-        if result.get("ok"):
+        if ok:
             print("OK")
-            lic = result.get("license", {})
             print()
             print(f"  Owner:        {lic.get('owner_name', '?')}")
             print(f"  Tier:         {lic.get('tier', '?')}")
             print(f"  Max Devices:  {lic.get('max_devices', '?')}")
             print(f"  Max Accounts: {lic.get('max_accounts', '?')}")
-            print(f"  Device ID:    {result.get('device_id', '?')}")
-            if result.get("is_new"):
+            print(f"  Device ID:    {device_id}")
+            if is_new:
                 print("  Status:       NEW device bound")
             print()
 
@@ -221,7 +233,7 @@ def cli_license_flow() -> str:
             return key
         else:
             print("FAILED")
-            print(f"  Error: {result.get('error', 'Unknown error')}")
+            print(f"  Error: {error}")
             print("  Try again.\n")
 
 
@@ -307,8 +319,22 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("Windsurf sidecar startup error: %s — windsurf-* models unavailable", e)
 
+    try:
+        from .solver_manager import solver_manager
+        if solver_manager.is_available():
+            log.info("Starting captcha solver...")
+            solver_ok = await solver_manager.start()
+            if solver_ok:
+                log.info("Captcha solver ready (port %d)", solver_manager.PORT)
+            else:
+                log.warning("Captcha solver failed to start — using 2captcha fallback")
+        else:
+            log.info("Captcha solver not available (camoufox not installed)")
+    except Exception as e:
+        log.warning("Captcha solver startup error: %s", e)
+
     # Start periodic GL exhaustion recovery (every 60s)
-    _gl_recovery_task: asyncio.Task | None = None
+    _gl_recovery_task: asyncio.Task[None] | None = None
 
     async def _periodic_gl_recovery():
         """Background loop: auto-recover GL accounts whose cooldown has expired."""
@@ -396,6 +422,11 @@ async def lifespan(app: FastAPI):
     try:
         from .windsurf_manager import windsurf_sidecar
         await windsurf_sidecar.stop()
+    except Exception:
+        pass
+    try:
+        from .solver_manager import solver_manager
+        await solver_manager.stop()
     except Exception:
         pass
     # NOTE: Do NOT stop tunnels or MCP servers here.
@@ -518,7 +549,7 @@ async def setup_password(request: Request):
     # Save password
     from .config import ADMIN_PASSWORD
     # Update the runtime config
-    import unified.config as cfg
+    from . import config as cfg
     cfg.ADMIN_PASSWORD = new_password
     # Persist to DB
     await db.set_setting("admin_password", new_password)

@@ -8,6 +8,7 @@ MCP server handles all tool execution.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import time
 import uuid
 from typing import Any
@@ -30,6 +31,23 @@ from .proxy_gumloop import (
 
 log = logging.getLogger("unified.proxy_glmcp")
 
+_MCP_WORKSPACES_FILE = Path(__file__).resolve().parent / "data" / ".mcp_workspaces"
+
+
+def _get_workspace_info() -> str:
+    if not _MCP_WORKSPACES_FILE.exists():
+        return ""
+    try:
+        lines = _MCP_WORKSPACES_FILE.read_text(encoding="utf-8").strip().splitlines()
+        paths = [l.strip() for l in lines if l.strip() and not l.strip().startswith("#")]
+    except Exception:
+        return ""
+    if not paths:
+        return ""
+    listing = "\n".join(f"  - {p}" for p in paths)
+    return f"\nALLOWED WORKSPACES (you can use absolute paths to access these):\n{listing}\n"
+
+
 _MCP_SYSTEM_RULES = (
     "You are a coding assistant. You have MCP tools connected to the user's LOCAL workspace.\n\n"
     "MANDATORY RULES (never violate):\n"
@@ -37,7 +55,7 @@ _MCP_SYSTEM_RULES = (
     "2. Sandbox tools run on a remote server, NOT the user's machine. MCP tools operate on the user's LOCAL filesystem.\n"
     "3. ALL output files (code, html, text) → write_file.\n"
     "4. ALL shell commands → bash.\n"
-    "5. WORKSPACE: ALWAYS use RELATIVE paths (e.g. 'file.txt', 'folder/file.py'). NEVER use absolute paths like D:\\, C:\\, /root/, etc. The MCP workspace root is '.' — all files go there.\n"
+    "5. WORKSPACE: Use relative paths for the primary workspace (root = '.'), OR absolute paths for any allowed workspace folder. Call list_directory('.') to see primary workspace, or list_directory with an absolute path for other workspaces.\n"
     "6. IMAGE WORKFLOW (critical):\n"
     "   a. Generate image with image_generator tool → you get a response with storage_link (gl:// URL)\n"
     "   b. Immediately call download_file with the EXACT gl:// URL and a filename\n"
@@ -45,7 +63,7 @@ _MCP_SYSTEM_RULES = (
     "   d. NEVER use sandbox_download. NEVER convert gl:// URLs to gumloop.com/files/ URLs.\n"
     "   e. The download_file MCP tool handles gl:// authentication internally.\n"
     "7. Respond in the same language as the user.\n"
-    "8. FORGET any previous workspace paths from earlier sessions. Your workspace is '.' (current directory). Use list_directory('.') to see what's there.\n\n"
+    "8. Primary workspace is '.' (current directory). Additional workspace folders may be accessible via absolute paths.\n\n"
     "AVAILABLE MCP TOOLS:\n"
     "- File: read_file, write_file, edit_file, delete_file, rename_file, copy_file, file_info, read_image\n"
     "- Directory: list_directory, tree, create_directory\n"
@@ -128,9 +146,21 @@ async def proxy_chat_completions(
         except (ValueError, TypeError) as e:
             log.warning("[GLMCP] Invalid chat_session_id '%s': %s", chat_session_id, e)
 
-    messages, rehydration_info = await _rehydrate_openai_messages_if_needed(
-        db, session_id_int if session_id_int else None, account_id, messages,
-    )
+    rehydration_info = {"injected": False, "count": 0, "mode": "none"}
+    if session_id_int and account_id:
+        try:
+            session_row = await db.get_chat_session(session_id_int)
+            last_account = int(session_row.get("last_gumloop_account_id", 0) or 0) if session_row else 0
+            is_cross_account = last_account > 0 and last_account != account_id
+            if is_cross_account:
+                messages, rehydration_info = await _rehydrate_openai_messages_if_needed(
+                    db, session_id_int, account_id, messages,
+                )
+                log.info("[GLMCP] cross-account rehydration: session=%s prev=%s new=%s injected=%s mode=%s",
+                         session_id_int, last_account, account_id,
+                         rehydration_info.get("injected"), rehydration_info.get("mode"))
+        except Exception as e:
+            log.error("[GLMCP] rehydration failed: session=%s account=%s error=%s", session_id_int, account_id, e)
 
     if not interaction_id and session_id_int and account_id:
         interaction_id = await db.get_or_create_gumloop_interaction_for_session_account(
@@ -182,7 +212,9 @@ async def proxy_chat_completions(
             status_code=400,
         ), 0.0
 
-    config_system = f"{_MCP_SYSTEM_RULES}\n{system_prompt}" if system_prompt else _MCP_SYSTEM_RULES
+    ws_info = _get_workspace_info()
+    base_system = f"{_MCP_SYSTEM_RULES}{ws_info}"
+    config_system = f"{base_system}\n{system_prompt}" if system_prompt else base_system
 
     try:
         await update_gummie_config(

@@ -572,6 +572,9 @@ async def chat_completions(request: Request, key_info: dict[str, Any] = Depends(
                         response_headers=resp_headers_str, response_body=log_body,
                         error_message=stream_error or error_msg,
                         proxy_url=_proxy_url,
+                        prompt_tokens=gl_stream_state.get("prompt_tokens", 0),
+                        completion_tokens=gl_stream_state.get("completion_tokens", 0),
+                        total_tokens=gl_stream_state.get("total_tokens", 0),
                     )
                     if _chat_session_id and gl_stream_state.get("content"):
                         try:

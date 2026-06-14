@@ -967,18 +967,70 @@ a:hover{text-decoration:underline}
       <div class="stat-card accent"><div class="card-label">Total Requests</div><div class="card-value" id="usage-total">-</div></div>
       <div class="stat-card green"><div class="card-label">Success Rate</div><div class="card-value" id="usage-success">-</div></div>
       <div class="stat-card"><div class="card-label">Avg Latency</div><div class="card-value" id="usage-latency">-</div></div>
-      <div class="stat-card" style="border-color:var(--cyan)"><div class="card-label">Captcha Solved</div><div class="card-value" id="usage-captcha" style="color:var(--cyan)">-</div><div class="card-sub" id="usage-captcha-err"></div></div>
+      <div class="stat-card" style="border-color:var(--orange)"><div class="card-label">Total Tokens</div><div class="card-value" id="usage-tokens" style="color:var(--orange)">-</div></div>
+<div class="stat-card" style="border-color:var(--cyan)"><div class="card-label">Captcha Solved</div><div class="card-value" id="usage-captcha" style="color:var(--cyan)">-</div><div class="card-sub" id="usage-captcha-err"></div></div>
     </div>
 
-    <!-- Captcha API Key Setting -->
-    <div style="display:flex;align-items:center;gap:.75rem;padding:.75rem 1rem;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:1.25rem;flex-wrap:wrap">
-      <span style="font-size:.8rem;font-weight:600;color:var(--text-dim)">&#x1f511; 2Captcha API Key</span>
-      <input type="text" id="captcha-key-input" placeholder="Enter 2Captcha API key..." style="flex:1;min-width:200px;padding:.4rem .65rem;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);font-family:'JetBrains Mono',monospace;font-size:.8rem;outline:none">
-      <span id="captcha-key-status" style="font-size:.75rem;color:var(--text-muted)"></span>
-      <button class="btn btn-sm btn-accent" onclick="saveCaptchaKey()">Save</button>
-      <button class="btn btn-sm btn-danger" onclick="clearCaptchaKey()">Clear</button>
+    <div style="padding:1rem;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:1.25rem">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;flex-wrap:wrap;margin-bottom:1rem">
+        <div>
+          <div style="font-size:.88rem;font-weight:700;color:var(--text)">&#x1f9e9; Captcha Solver</div>
+          <div style="font-size:.76rem;color:var(--text-dim);margin-top:.25rem">Choose how captcha solving is routed, manage the self-host worker, and keep 2Captcha ready as fallback.</div>
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:.9rem">
+        <div>
+          <div style="font-size:.74rem;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:.45rem">Provider</div>
+          <div style="display:inline-flex;gap:.35rem;padding:.3rem;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);flex-wrap:wrap">
+            <button type="button" id="captcha-provider-auto" class="btn btn-sm" style="margin:0" onclick="setCaptchaProvider('auto')">Auto (Recommended)</button>
+            <button type="button" id="captcha-provider-selfhost" class="btn btn-sm" style="margin:0" onclick="setCaptchaProvider('selfhost')">Self-Host Only</button>
+            <button type="button" id="captcha-provider-2captcha" class="btn btn-sm" style="margin:0" onclick="setCaptchaProvider('2captcha')">2Captcha Only</button>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:.75rem;padding:.8rem .9rem;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);flex-wrap:wrap">
+          <div style="display:flex;flex-direction:column;gap:.2rem;min-width:220px">
+            <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
+              <span style="font-size:.78rem;font-weight:600;color:var(--text)">Self-Host Solver</span>
+              <span id="captcha-solver-status-dot" style="width:.55rem;height:.55rem;border-radius:999px;background:var(--red);box-shadow:0 0 0 2px rgba(239,68,68,.15)"></span>
+              <span id="captcha-solver-status-label" style="font-size:.76rem;font-weight:600;color:var(--red)">Stopped</span>
+            </div>
+            <div id="captcha-solver-status-meta" style="font-size:.74rem;color:var(--text-dim)">PID — • Port —</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
+            <button class="btn btn-sm btn-accent" id="captcha-solver-start-btn" onclick="startSolver()">Start</button>
+            <button class="btn btn-sm btn-danger" id="captcha-solver-stop-btn" onclick="stopSolver()">Stop</button>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:.75rem;padding:.8rem .9rem;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);flex-wrap:wrap">
+          <div style="min-width:160px">
+            <div style="font-size:.78rem;font-weight:600;color:var(--text)">Self-Host Proxy</div>
+            <div style="font-size:.74rem;color:var(--text-dim);margin-top:.2rem">Optional upstream proxy for the local solver</div>
+          </div>
+          <input type="text" id="captcha-solver-proxy-input" placeholder="socks5://user:pass@host:port" style="flex:1;min-width:240px;padding:.45rem .7rem;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);font-family:'JetBrains Mono',monospace;font-size:.82rem;outline:none">
+          <span id="captcha-solver-proxy-status" style="font-size:.74rem;color:var(--text-muted)"></span>
+          <button class="btn btn-sm btn-accent" onclick="saveSolverProxy()">Save</button>
+        </div>
+        <div id="captcha-key-section" style="display:flex;align-items:center;gap:.75rem;padding:.8rem .9rem;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);flex-wrap:wrap">
+          <span style="font-size:.8rem;font-weight:600;color:var(--text-dim)">&#x1f511; 2Captcha API Key</span>
+          <input type="text" id="captcha-key-input" placeholder="Enter 2Captcha API key..." style="flex:1;min-width:220px;padding:.4rem .65rem;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);font-family:'JetBrains Mono',monospace;font-size:.8rem;outline:none">
+          <span id="captcha-key-status" style="font-size:.75rem;color:var(--text-muted)"></span>
+          <button class="btn btn-sm btn-accent" onclick="saveCaptchaKey()">Save</button>
+          <button class="btn btn-sm btn-danger" onclick="clearCaptchaKey()">Clear</button>
+        </div>
+      </div>
     </div>
 
+    <div class="section-title">Recent Captcha Solves</div>
+    <div class="table-wrap" style="margin-bottom:1.25rem">
+      <table>
+        <thead>
+          <tr><th>Time</th><th>Provider</th><th>Proxy</th><th>Solve Time</th><th>Token Len</th><th>Status</th></tr>
+        </thead>
+        <tbody id="captcha-solves-tbody">
+          <tr><td colspan="6" class="empty-state">No solves yet</td></tr>
+        </tbody>
+      </table>
+    </div>
 
     <div class="section-title">Requests by Model (Top 10)</div>
     <div class="chart-container">
@@ -989,10 +1041,10 @@ a:hover{text-decoration:underline}
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th>Time</th><th>Model</th><th>Tier</th><th>Account</th><th>Status</th><th>Latency</th></tr>
+          <tr><th>Time</th><th>Model</th><th>Tier</th><th>Account</th><th>Tokens</th><th>Status</th><th>Latency</th></tr>
         </thead>
         <tbody id="usage-tbody">
-          <tr><td colspan="6"><div class="loading-overlay"><div class="loading-spinner"></div> Loading usage data...</div></td></tr>
+          <tr><td colspan="7"><div class="loading-overlay"><div class="loading-spinner"></div> Loading usage data...</div></td></tr>
         </tbody>
       </table>
     </div>
@@ -1016,6 +1068,7 @@ a:hover{text-decoration:underline}
             <th>Time</th>
             <th>Model</th>
             <th>Tier</th>
+            <th>Tokens</th>
             <th>Status</th>
             <th>Latency</th>
             <th>Account</th>
@@ -1023,7 +1076,7 @@ a:hover{text-decoration:underline}
           </tr>
         </thead>
         <tbody id="logs-tbody">
-          <tr><td colspan="7"><div class="loading-overlay"><div class="loading-spinner"></div> Loading logs...</div></td></tr>
+          <tr><td colspan="8"><div class="loading-overlay"><div class="loading-spinner"></div> Loading logs...</div></td></tr>
         </tbody>
       </table>
     </div>
@@ -1488,6 +1541,36 @@ a:hover{text-decoration:underline}
         <button class="btn btn-sm" onclick="loadMcpApiKey()">Load Current</button>
       </div>
       <div id="mcp-apikey-status" style="font-size:.75rem;margin-top:.4rem;color:var(--text-muted)"></div>
+    </div>
+
+    <!-- MCP Workspaces (multi-folder access) -->
+    <div class="section-title" style="margin-bottom:.75rem">MCP Workspaces</div>
+    <div class="stat-card" style="padding:1.25rem;margin-bottom:1.5rem">
+      <p class="text-dim" style="font-size:.82rem;margin-bottom:.75rem">Folder paths accessible by MCP server. All paths in this list can be read/written by MCP tools.</p>
+      <div id="mcp-workspaces-list" style="margin-bottom:.75rem"></div>
+      <div style="display:flex;gap:.5rem;align-items:center">
+        <input type="text" id="mcp-ws-add-input" placeholder="C:\Users\User\my-project" style="flex:1;padding:.45rem .7rem;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);font-size:.82rem;font-family:'JetBrains Mono',monospace">
+        <button class="btn btn-accent btn-sm" onclick="addMcpWorkspace()">Add</button>
+      </div>
+      <div id="mcp-ws-status" style="font-size:.75rem;margin-top:.4rem;color:var(--text-muted)"></div>
+    </div>
+
+    <!-- Named Tunnel (persistent URL) -->
+    <div class="section-title" style="margin-bottom:.75rem">Named Tunnel (Persistent URL)</div>
+    <div class="stat-card" style="padding:1.25rem;margin-bottom:1.5rem">
+      <p class="text-dim" style="font-size:.82rem;margin-bottom:.75rem">Fixed MCP URL via Cloudflare Named Tunnel. URL never changes regardless of workspace.</p>
+      <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.75rem">
+        <span class="text-dim" style="font-size:.78rem;white-space:nowrap">MCP URL:</span>
+        <code id="named-tunnel-url" style="flex:1;padding:.4rem .6rem;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:.82rem;font-family:'JetBrains Mono',monospace;color:var(--accent);cursor:pointer;word-break:break-all" onclick="copyToClipboard(this.textContent).then(()=>toast('URL copied','success'))">https://mcp.juhuw.info/mcp</code>
+      </div>
+      <div style="display:flex;gap:.5rem;align-items:center">
+        <span class="text-dim" style="font-size:.78rem;white-space:nowrap">Status:</span>
+        <span class="badge" id="named-tunnel-badge" style="margin-right:.5rem">checking...</span>
+        <button class="btn btn-accent btn-sm" id="btn-named-tunnel-start" onclick="startNamedTunnel()">Start</button>
+        <button class="btn btn-danger btn-sm" id="btn-named-tunnel-stop" onclick="stopNamedTunnel()" style="display:none">Stop</button>
+        <button class="btn btn-sm" onclick="checkNamedTunnel()">Check</button>
+      </div>
+      <div id="named-tunnel-info" class="text-dim" style="font-size:.72rem;margin-top:.5rem"></div>
     </div>
 
     <!-- Active MCP Servers -->
@@ -2038,7 +2121,8 @@ function initDashboard() {
   try { startLogsAutoRefresh(); } catch(e) { console.error('startLogsAutoRefresh:', e); }
   try { loadBatchStatus(); } catch(e) { console.error('loadBatchStatus:', e); }
   try { loadFilters(); } catch(e) { console.error('loadFilters:', e); }
-  try { loadCaptchaKey(); } catch(e) { console.error('loadCaptchaKey:', e); }
+  try { loadCaptchaSettings(); } catch(e) { console.error('loadCaptchaSettings:', e); }
+  try { loadCaptchaSolves(); } catch(e) { console.error('loadCaptchaSolves:', e); }
   try { setupDocsHost(); } catch(e) { console.error('setupDocsHost:', e); }
 
   var el;
@@ -2082,8 +2166,10 @@ function initTabs() {
       // Load proxy data when proxy tab is activated
       if (btn.dataset.tab === 'proxy') { loadProxies('api'); loadProxies('batch'); }
       if (btn.dataset.tab === 'filter') { loadFilters(); loadGlobalFilters(); }
-      if (btn.dataset.tab === 'tunnel') { loadTunnelStatus(); loadMcpInstances(); loadMcpApiKey(); startTunnelRefresh(); }
+      if (btn.dataset.tab === 'tunnel') { loadTunnelStatus(); loadMcpInstances(); loadMcpApiKey(); loadMcpWorkspaces(); checkNamedTunnel(); startTunnelRefresh(); }
       else { stopTunnelRefresh(); }
+      if (btn.dataset.tab === 'usage') { loadCaptchaSettings(); loadCaptchaSolves(); }
+      else { if (_captchaSolveSSE) { _captchaSolveSSE.close(); _captchaSolveSSE = null; } }
       if (btn.dataset.tab === 'vps') { loadVpsList(); }
       if (btn.dataset.tab === 'docs') { setupDocsHost(); }
     });
@@ -4061,6 +4147,9 @@ async function loadUsage() {
     const latency = stats.avg_latency || stats.avgLatency || 0;
     document.getElementById('usage-latency').textContent = (typeof latency === 'number' ? latency.toFixed(0) : latency) + 'ms';
 
+    var totalTokens = stats.total_tokens || 0;
+    document.getElementById('usage-tokens').textContent = formatNum(totalTokens);
+
     // Captcha stats
     const captcha = stats.captcha || {};
     document.getElementById('usage-captcha').textContent = captcha.solved || 0;
@@ -4087,23 +4176,144 @@ async function loadUsage() {
   }
 }
 
-// ── Captcha API Key ──
-async function loadCaptchaKey() {
+function updateCaptchaProviderUI(provider) {
+  var selected = provider || 'auto';
+  ['auto', 'selfhost', '2captcha'].forEach(function(val) {
+    var btn = document.getElementById('captcha-provider-' + val);
+    if (!btn) return;
+    btn.className = selected === val ? 'btn btn-sm btn-accent' : 'btn btn-sm';
+    btn.style.opacity = selected === val ? '1' : '.9';
+  });
+  var keySection = document.getElementById('captcha-key-section');
+  if (keySection) keySection.style.display = selected === 'selfhost' ? 'none' : 'flex';
+}
+
+function updateCaptchaKeyState(data, savedText) {
+  var input = document.getElementById('captcha-key-input');
+  var status = document.getElementById('captcha-key-status');
+  if (!input || !status) return;
+  if (data && data.has_key) {
+    input.placeholder = data.key_preview || 'Key set';
+    input.value = '';
+    status.textContent = savedText || '✓ Key configured';
+    status.style.color = 'var(--green)';
+  } else {
+    input.placeholder = 'Enter 2Captcha API key...';
+    input.value = '';
+    status.textContent = 'No key set';
+    status.style.color = 'var(--orange)';
+  }
+}
+
+function updateSolverStatusUI(data) {
+  var solver = data || {};
+  var running = !!solver.running;
+  var available = solver.available !== false;
+  var dot = document.getElementById('captcha-solver-status-dot');
+  var label = document.getElementById('captcha-solver-status-label');
+  var meta = document.getElementById('captcha-solver-status-meta');
+  var startBtn = document.getElementById('captcha-solver-start-btn');
+  var stopBtn = document.getElementById('captcha-solver-stop-btn');
+  if (dot) {
+    dot.style.background = running ? 'var(--green)' : 'var(--red)';
+    dot.style.boxShadow = running ? '0 0 0 2px rgba(52,211,153,.15)' : '0 0 0 2px rgba(239,68,68,.15)';
+  }
+  if (label) {
+    label.textContent = running ? 'Running' : 'Stopped';
+    label.style.color = running ? 'var(--green)' : 'var(--red)';
+  }
+  if (meta) {
+    var parts = [];
+    parts.push('PID ' + (solver.pid || '—'));
+    parts.push('Port ' + (solver.port || '—'));
+    if (!available) parts.push('Unavailable');
+    meta.textContent = parts.join(' • ');
+  }
+  if (startBtn) {
+    startBtn.disabled = !available || running;
+    startBtn.style.opacity = (!available || running) ? '.6' : '1';
+    startBtn.style.cursor = (!available || running) ? 'not-allowed' : '';
+  }
+  if (stopBtn) {
+    stopBtn.disabled = !available || !running;
+    stopBtn.style.opacity = (!available || !running) ? '.6' : '1';
+    stopBtn.style.cursor = (!available || !running) ? 'not-allowed' : '';
+  }
+}
+
+async function loadCaptchaSettings() {
   try {
     const data = await apiFetch('/api/settings/captcha');
-    var input = document.getElementById('captcha-key-input');
-    var status = document.getElementById('captcha-key-status');
-    if (data.has_key) {
-      input.placeholder = data.key_preview || 'Key set';
-      input.value = '';
-      status.textContent = '✓ Key configured';
-      status.style.color = 'var(--green)';
-    } else {
-      input.placeholder = 'Enter 2Captcha API key...';
-      status.textContent = 'No key set';
-      status.style.color = 'var(--orange)';
-    }
+    updateCaptchaProviderUI(data.provider || 'auto');
+    updateCaptchaKeyState(data);
+    updateSolverStatusUI(data.solver_status || {});
+    await loadSolverStatus();
   } catch (e) {}
+}
+
+async function setCaptchaProvider(val) {
+  try {
+    await apiFetch('/api/settings/captcha/provider', {
+      method: 'POST', body: JSON.stringify({ provider: val })
+    });
+    updateCaptchaProviderUI(val);
+    await loadCaptchaSettings();
+    toast('Captcha provider updated', 'success');
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+async function loadSolverStatus() {
+  try {
+    const data = await apiFetch('/api/settings/captcha/solver/status');
+    updateSolverStatusUI(data);
+    var proxyInput = document.getElementById('captcha-solver-proxy-input');
+    var proxyStatus = document.getElementById('captcha-solver-proxy-status');
+    if (proxyInput) proxyInput.value = data.proxy || '';
+    if (proxyStatus) {
+      proxyStatus.textContent = data.proxy ? 'Proxy configured' : 'No proxy';
+      proxyStatus.style.color = data.proxy ? 'var(--green)' : 'var(--text-muted)';
+    }
+  } catch (e) {
+    updateSolverStatusUI({ running: false, available: false });
+    var proxyStatus = document.getElementById('captcha-solver-proxy-status');
+    if (proxyStatus) {
+      proxyStatus.textContent = 'Status unavailable';
+      proxyStatus.style.color = 'var(--orange)';
+    }
+  }
+}
+
+async function startSolver() {
+  try {
+    await apiFetch('/api/settings/captcha/solver/start', { method: 'POST' });
+    await loadSolverStatus();
+    toast('Captcha solver started', 'success');
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+async function stopSolver() {
+  try {
+    await apiFetch('/api/settings/captcha/solver/stop', { method: 'POST' });
+    await loadSolverStatus();
+    toast('Captcha solver stopped', 'success');
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+async function saveSolverProxy() {
+  var input = document.getElementById('captcha-solver-proxy-input');
+  var proxyStatus = document.getElementById('captcha-solver-proxy-status');
+  var proxy = input ? input.value.trim() : '';
+  try {
+    await apiFetch('/api/settings/captcha/solver/proxy', {
+      method: 'POST', body: JSON.stringify({ proxy: proxy })
+    });
+    if (proxyStatus) {
+      proxyStatus.textContent = proxy ? 'Proxy saved' : 'Proxy cleared';
+      proxyStatus.style.color = 'var(--green)';
+    }
+    await loadSolverStatus();
+    toast(proxy ? 'Solver proxy saved' : 'Solver proxy cleared', 'success');
+  } catch (e) { toast('Failed: ' + e.message, 'error'); }
 }
 
 async function saveCaptchaKey() {
@@ -4114,10 +4324,7 @@ async function saveCaptchaKey() {
     var data = await apiFetch('/api/settings/captcha', {
       method: 'POST', body: JSON.stringify({ api_key: key })
     });
-    input.value = '';
-    input.placeholder = data.key_preview || 'Key set';
-    document.getElementById('captcha-key-status').textContent = '✓ Key saved';
-    document.getElementById('captcha-key-status').style.color = 'var(--green)';
+    updateCaptchaKeyState({ has_key: true, key_preview: data.key_preview || 'Key set' }, '✓ Key saved');
     toast('Captcha API key saved', 'success');
   } catch (e) { toast('Failed: ' + e.message, 'error'); }
 }
@@ -4126,12 +4333,109 @@ async function clearCaptchaKey() {
   if (!confirm('Clear captcha API key?')) return;
   try {
     await apiFetch('/api/settings/captcha', { method: 'DELETE' });
-    document.getElementById('captcha-key-input').placeholder = 'Enter 2Captcha API key...';
-    document.getElementById('captcha-key-input').value = '';
-    document.getElementById('captcha-key-status').textContent = 'No key set';
-    document.getElementById('captcha-key-status').style.color = 'var(--orange)';
+    updateCaptchaKeyState({ has_key: false });
     toast('Captcha API key cleared', 'success');
   } catch (e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+var _captchaSolveSSE = null;
+var _captchaSolveRows = [];
+
+function _renderSolveRow(s) {
+  var providerLabel = s.provider === 'selfhost' ? 'Self-Host' : '2Captcha';
+  var proxyDisplay = s.proxy ? escHtml(s.proxy.length > 40 ? s.proxy.substring(0, 40) + '…' : s.proxy) : 'Direct';
+  if (s.status === 'solving') {
+    return '<tr id="solve-row-' + s.id + '" style="opacity:.7">' +
+      '<td class="text-dim text-sm">' + relativeTime(s.timestamp) + '</td>' +
+      '<td class="mono text-sm">' + providerLabel + '</td>' +
+      '<td class="mono text-sm text-dim" title="' + escHtml(s.proxy || '') + '">' + proxyDisplay + '</td>' +
+      '<td class="mono text-sm"><span style="color:var(--orange)">solving…</span></td>' +
+      '<td class="mono text-sm">—</td>' +
+      '<td><span class="badge" style="background:var(--orange);color:#fff">solving</span></td>' +
+      '</tr>';
+  }
+  var statusOk = s.status === 'success';
+  var badge = statusOk ? 'badge-success' : 'badge-error';
+  return '<tr id="solve-row-' + s.id + '">' +
+    '<td class="text-dim text-sm">' + relativeTime(s.timestamp) + '</td>' +
+    '<td class="mono text-sm">' + providerLabel + '</td>' +
+    '<td class="mono text-sm text-dim" title="' + escHtml(s.proxy || '') + '">' + proxyDisplay + '</td>' +
+    '<td class="mono text-sm">' + s.solve_time_s + 's</td>' +
+    '<td class="mono text-sm">' + (s.token_len || '—') + '</td>' +
+    '<td><span class="badge ' + badge + '">' + s.status + '</span></td>' +
+    '</tr>';
+}
+
+function _renderAllSolveRows() {
+  var tbody = document.getElementById('captcha-solves-tbody');
+  if (!tbody) return;
+  if (!_captchaSolveRows.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No solves yet</td></tr>';
+    return;
+  }
+  tbody.innerHTML = _captchaSolveRows.map(_renderSolveRow).join('');
+}
+
+async function loadCaptchaSolves() {
+  var tbody = document.getElementById('captcha-solves-tbody');
+  if (!tbody) return;
+  try {
+    var data = await apiFetch('/api/captcha/solves');
+    var solves = (data && data.solves) ? data.solves : [];
+    _captchaSolveRows = solves;
+    _renderAllSolveRows();
+  } catch (e) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">Failed to load</td></tr>';
+  }
+  _connectCaptchaSolveSSE();
+}
+
+function _connectCaptchaSolveSSE() {
+  if (_captchaSolveSSE) return;
+  var pw = getAdminPassword();
+  if (!pw) return;
+  var es = new EventSource('/api/captcha/solves/stream?token=' + encodeURIComponent(pw));
+  _captchaSolveSSE = es;
+
+  es.onmessage = function(evt) {
+    try {
+      var ev = JSON.parse(evt.data);
+      if (ev.event === 'connected') return;
+      if (ev.event === 'solve_start') {
+        _captchaSolveRows.unshift({
+          id: ev.id,
+          timestamp: ev.timestamp,
+          provider: ev.provider,
+          proxy: ev.proxy || '',
+          status: 'solving',
+          solve_time_s: 0,
+          token_len: 0,
+        });
+        if (_captchaSolveRows.length > 100) _captchaSolveRows.length = 100;
+        _renderAllSolveRows();
+      } else if (ev.event === 'solve_complete') {
+        var found = false;
+        for (var i = 0; i < _captchaSolveRows.length; i++) {
+          if (_captchaSolveRows[i].id === ev.id) {
+            _captchaSolveRows[i] = ev;
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          _captchaSolveRows.unshift(ev);
+          if (_captchaSolveRows.length > 100) _captchaSolveRows.length = 100;
+        }
+        _renderAllSolveRows();
+      }
+    } catch (e) {}
+  };
+
+  es.onerror = function() {
+    es.close();
+    _captchaSolveSSE = null;
+    setTimeout(_connectCaptchaSolveSSE, 5000);
+  };
 }
 
 function formatNum(n) {
@@ -4177,7 +4481,7 @@ function renderUsageChart(modelStats) {
 function renderRecentRequests(requests) {
   const tbody = document.getElementById('usage-tbody');
   if (!requests || requests.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No recent requests</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" class="empty-state">No recent requests</td></tr>';
     return;
   }
 
@@ -4190,6 +4494,7 @@ function renderRecentRequests(requests) {
     const statusOk = (typeof statusCode === 'number') ? (statusCode >= 200 && statusCode < 400) : (statusCode === 'success');
     const statusLabel = statusOk ? 'success' : 'error';
     const latency = r.latency_ms || r.latency || r.duration || 0;
+    const tokens = r.total_tokens || 0;
     const tierBadge = tier === 'max' ? 'badge-max' : 'badge-standard';
     const statusBadge = statusOk ? 'badge-success' : 'badge-error';
 
@@ -4198,6 +4503,7 @@ function renderRecentRequests(requests) {
       '<td class="mono text-sm">' + escHtml(model) + '</td>' +
       '<td><span class="badge ' + tierBadge + '">' + escHtml(tier) + '</span></td>' +
       '<td class="text-dim text-sm">' + escHtml(account) + '</td>' +
+      '<td class="mono text-sm">' + (tokens ? tokens.toLocaleString() : '—') + '</td>' +
       '<td><span class="badge ' + statusBadge + '">' + statusLabel + '</span></td>' +
       '<td class="mono text-sm">' + (typeof latency === 'number' ? Math.round(latency) : latency) + 'ms</td>' +
     '</tr>';
@@ -4230,12 +4536,11 @@ function truncateProxy(url, maxLen) {
 function renderLogs() {
   const tbody = document.getElementById('logs-tbody');
   if (!logsData || logsData.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" class="empty-state">No logs yet</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No logs yet</td></tr>';
     renderLogsPagination(0);
     return;
   }
 
-  // Paginate
   const totalPages = Math.ceil(logsData.length / logsPerPage);
   if (logsPage > totalPages) logsPage = totalPages;
   if (logsPage < 1) logsPage = 1;
@@ -4252,6 +4557,7 @@ function renderLogs() {
     const latency = log.latency_ms || log.latency || 0;
     const account = log.account_email || log.account || log.email || '—';
     const proxyUrl = log.proxy_url || '';
+    const tokens = log.total_tokens || 0;
     const tierBadge = tier === 'max' ? 'badge-max' : 'badge-standard';
     const statusOk = statusCode >= 200 && statusCode < 400;
     const statusBadge = statusOk ? 'badge-success' : 'badge-error';
@@ -4260,6 +4566,7 @@ function renderLogs() {
       '<td class="text-dim text-sm">' + relativeTime(time) + '</td>' +
       '<td class="mono text-sm">' + escHtml(model) + '</td>' +
       '<td><span class="badge ' + tierBadge + '">' + escHtml(tier || 'std') + '</span></td>' +
+      '<td class="mono text-sm">' + (tokens ? tokens.toLocaleString() : '—') + '</td>' +
       '<td><span class="badge ' + statusBadge + '">' + statusCode + '</span></td>' +
       '<td class="mono text-sm">' + latency + 'ms</td>' +
       '<td class="text-dim text-sm">' + escHtml(account) + '</td>' +
@@ -5663,6 +5970,122 @@ async function startDeleteMcp() {
   btn.disabled = false; btn.textContent = 'Delete from All Accounts';
 }
 
+// ── MCP Workspaces ──
+
+async function loadMcpWorkspaces() {
+  var el = document.getElementById('mcp-workspaces-list');
+  try {
+    var data = await apiFetch('/api/mcp/workspaces');
+    var paths = data.workspaces || [];
+    if (!paths.length) {
+      el.innerHTML = '<div class="text-dim" style="font-size:.82rem;margin-bottom:.5rem">No workspaces configured.</div>';
+      return;
+    }
+    var html = '';
+    paths.forEach(function(p) {
+      html += '<div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.35rem;padding:.35rem .6rem;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm)">';
+      html += '<span class="mono" style="flex:1;font-size:.8rem;word-break:break-all">' + p + '</span>';
+      html += '<button class="btn btn-sm btn-danger" style="font-size:.68rem;padding:.2rem .5rem" onclick="removeMcpWorkspace(\'' + p.replace(/\\/g, '\\\\').replace(/'/g, "\\'") + '\')">×</button>';
+      html += '</div>';
+    });
+    el.innerHTML = html;
+  } catch(e) {
+    el.innerHTML = '<div style="color:var(--red);font-size:.82rem">Error: ' + e.message + '</div>';
+  }
+}
+
+async function addMcpWorkspace() {
+  var input = document.getElementById('mcp-ws-add-input');
+  var status = document.getElementById('mcp-ws-status');
+  var path = input.value.trim();
+  if (!path) { toast('Enter a folder path', 'error'); return; }
+  try {
+    var data = await apiFetch('/api/mcp/workspaces', { method: 'POST', body: JSON.stringify({ action: 'add', path: path }) });
+    if (data.ok) {
+      toast('Workspace added: ' + path, 'success');
+      input.value = '';
+      status.textContent = 'Added. MCP server can now access this path.';
+      status.style.color = 'var(--green)';
+      loadMcpWorkspaces();
+    } else {
+      status.textContent = data.error || 'Failed';
+      status.style.color = 'var(--red)';
+    }
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function removeMcpWorkspace(path) {
+  if (!confirm('Remove workspace?\n' + path)) return;
+  try {
+    var data = await apiFetch('/api/mcp/workspaces', { method: 'POST', body: JSON.stringify({ action: 'remove', path: path }) });
+    if (data.ok) {
+      toast('Workspace removed', 'success');
+      loadMcpWorkspaces();
+    } else { toast(data.error || 'Failed', 'error'); }
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+// ── Named Tunnel ──
+
+async function checkNamedTunnel() {
+  var badge = document.getElementById('named-tunnel-badge');
+  var info = document.getElementById('named-tunnel-info');
+  var btnStart = document.getElementById('btn-named-tunnel-start');
+  var btnStop = document.getElementById('btn-named-tunnel-stop');
+  badge.textContent = 'checking...';
+  badge.className = 'badge badge-queued';
+  try {
+    var data = await apiFetch('/api/mcp/named-tunnel/status');
+    if (data.running) {
+      badge.textContent = 'running';
+      badge.className = 'badge badge-active';
+      info.textContent = 'PID: ' + (data.pid || '?') + ' | Port: ' + (data.port || '9876');
+      btnStart.style.display = 'none';
+      btnStop.style.display = '';
+    } else {
+      badge.textContent = 'stopped';
+      badge.className = 'badge badge-queued';
+      info.textContent = data.error || '';
+      btnStart.style.display = '';
+      btnStop.style.display = 'none';
+    }
+  } catch(e) {
+    badge.textContent = 'error';
+    badge.className = 'badge badge-error';
+    info.textContent = e.message;
+    btnStart.style.display = '';
+    btnStop.style.display = 'none';
+  }
+}
+
+async function startNamedTunnel() {
+  var badge = document.getElementById('named-tunnel-badge');
+  var info = document.getElementById('named-tunnel-info');
+  badge.textContent = 'starting...';
+  badge.className = 'badge badge-queued';
+  try {
+    var data = await apiFetch('/api/mcp/named-tunnel/start', { method: 'POST' });
+    if (data.ok) {
+      toast('Named tunnel started → mcp.juhuw.info', 'success');
+      setTimeout(checkNamedTunnel, 2000);
+    } else {
+      toast('Failed: ' + (data.error || ''), 'error');
+      info.textContent = data.error || '';
+      badge.textContent = 'error';
+      badge.className = 'badge badge-error';
+    }
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
+async function stopNamedTunnel() {
+  try {
+    var data = await apiFetch('/api/mcp/named-tunnel/stop', { method: 'POST' });
+    if (data.ok) { toast('Named tunnel stopped', 'success'); }
+    else { toast('Failed: ' + (data.error || ''), 'error'); }
+    checkNamedTunnel();
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+}
+
 function startTunnelRefresh() {
   if (tunnelRefreshInterval) clearInterval(tunnelRefreshInterval);
   tunnelRefreshInterval = setInterval(loadTunnelStatus, 10000);
@@ -5739,6 +6162,11 @@ window.showMcpListModal = showMcpListModal;
 window.closeMcpListModal = closeMcpListModal;
 window.closeDeleteMcpModal = closeDeleteMcpModal;
 window.startDeleteMcp = startDeleteMcp;
+window.addMcpWorkspace = addMcpWorkspace;
+window.removeMcpWorkspace = removeMcpWorkspace;
+window.startNamedTunnel = startNamedTunnel;
+window.stopNamedTunnel = stopNamedTunnel;
+window.checkNamedTunnel = checkNamedTunnel;
 </script>
 </body>
 </html>

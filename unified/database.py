@@ -1176,11 +1176,13 @@ async def log_usage(
     response_body: str = "",
     error_message: str = "",
     proxy_url: str = "",
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    total_tokens: int = 0,
 ) -> int:
     global _usage_log_id_counter
     _usage_log_id_counter += 1
 
-    # Resolve account email
     account_email = ""
     if account_id:
         acc = await get_account(account_id)
@@ -1202,24 +1204,33 @@ async def log_usage(
         "response_body": response_body,
         "error_message": error_message,
         "proxy_url": proxy_url,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     _usage_logs.append(entry)
 
-    # Trim to max size
     if len(_usage_logs) > _MAX_USAGE_LOGS:
         _usage_logs[:] = _usage_logs[-_MAX_USAGE_LOGS:]
 
-    # Buffer for central sync (lightweight metadata only)
+    if total_tokens > 0:
+        try:
+            prev = int(await get_setting("total_tokens_all_time", "0"))
+            await set_setting("total_tokens_all_time", str(prev + total_tokens))
+        except Exception:
+            pass
+
     try:
         from . import license_client
         license_client.buffer_usage_log(
             model=model, tier=tier, status_code=status_code,
             latency_ms=latency_ms, proxy_url=proxy_url,
             error_message=error_message, account_email=account_email,
+            tokens=total_tokens,
         )
     except Exception:
-        pass  # License client not initialized or import error — ignore
+        pass
 
     return _usage_log_id_counter
 
@@ -1233,12 +1244,14 @@ async def get_usage_stats() -> dict:
     success_count = 0
     total_latency = 0
     latency_count = 0
+    sum_tokens = 0
 
     for log in _usage_logs:
         t = log["tier"]
         m = log["model"]
         by_tier[t] = by_tier.get(t, 0) + 1
         by_model[m] = by_model.get(m, 0) + 1
+        sum_tokens += log.get("total_tokens", 0)
         if 200 <= log["status_code"] < 400:
             success_count += 1
             total_latency += log["latency_ms"]
@@ -1272,10 +1285,13 @@ async def get_usage_stats() -> dict:
 
     recent = _usage_logs[-20:][::-1]
 
+    persisted_tokens = int(await get_setting("total_tokens_all_time", "0"))
+
     return {
         "total_requests": total,
         "success_rate": round(success_rate, 1),
         "avg_latency": round(avg_latency),
+        "total_tokens": persisted_tokens,
         "requests_by_tier": by_tier,
         "requests_by_model": by_model,
         "by_model": by_model,

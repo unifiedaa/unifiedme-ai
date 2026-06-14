@@ -109,7 +109,6 @@ def _trim_old_tool_result_text(text: str) -> str:
 
 
 def _get_turnstile() -> TurnstileSolver:
-    """Get or create the shared TurnstileSolver."""
     global _turnstile
     if _turnstile is None:
         api_key = os.getenv("CAPTCHA_API_KEY", "")
@@ -118,12 +117,13 @@ def _get_turnstile() -> TurnstileSolver:
 
 
 async def _ensure_turnstile_key() -> None:
-    """Load captcha API key from DB settings if not already set."""
     ts = _get_turnstile()
+    from . import database as db
+    provider = await db.get_setting("captcha_provider", "auto")
+    ts.update_provider(provider)
     if ts._api_key:
         ts.start_pool()
         return
-    from . import database as db
     key = await db.get_setting("captcha_api_key", "")
     if key:
         ts.update_api_key(key)

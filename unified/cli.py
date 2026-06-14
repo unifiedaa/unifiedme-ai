@@ -744,6 +744,42 @@ def cmd_fix():
         else:
             print(f"  {OK} Camoufox system deps ({len(cam_installed)} packages)")
 
+    # 4c. Check captcha solver Python deps (camoufox + quart)
+    solver_deps = {"camoufox": False, "quart": False}
+    for pkg in solver_deps:
+        try:
+            result = subprocess.run(
+                [venv_python or "python", "-c", f"import {pkg}"],
+                capture_output=True, timeout=10,
+            )
+            solver_deps[pkg] = result.returncode == 0
+        except Exception:
+            pass
+
+    if all(solver_deps.values()):
+        print(f"  {OK} Captcha solver deps (camoufox, quart)")
+    else:
+        missing_solver = [k for k, v in solver_deps.items() if not v]
+        print(f"  {WARN} Captcha solver deps missing: {', '.join(missing_solver)}")
+        try:
+            answer = input("  Install captcha solver? (free local Turnstile solving) [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = "n"
+        if answer != "n":
+            pip_cmd = venv_pip or "pip"
+            print(f"  Installing camoufox + quart...")
+            result = subprocess.run(
+                [pip_cmd, "install", "camoufox[geoip]", "quart"],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode == 0:
+                print(f"  {OK} Captcha solver deps installed")
+            else:
+                print(f"  {FAIL} Install failed: {result.stderr[-200:]}")
+                print(f"       Manual: {pip_cmd} install camoufox[geoip] quart")
+        else:
+            print(f"  {YELLOW}  Skipped. 2Captcha API key required for GL models.{NC}")
+
     # 5. Check license
     from .main import LICENSE_FILE
     if LICENSE_FILE.exists():

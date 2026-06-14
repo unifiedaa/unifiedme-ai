@@ -40,11 +40,13 @@ log = logging.getLogger("mcp")
 # ─── Config (set by main() before server starts) ────────────────────────────
 
 WORKSPACE: Path = Path(".")
+ALLOWED_WORKSPACES: list[Path] = []
 PROXY_BASE_URL = os.environ.get("PROXY_BASE_URL", "http://127.0.0.1:1430")
 PROXY_API_KEY = ""  # Set by main() from --api-key, env var, or config file
 
-# Config file path for persisting API key
+# Config file paths
 _MCP_CONFIG_FILE = Path(__file__).resolve().parent / "unified" / "data" / ".mcp_api_key"
+_MCP_WORKSPACES_FILE = Path(__file__).resolve().parent / "unified" / "data" / ".mcp_workspaces"
 
 
 def _load_api_key(cli_key: str = "") -> str:
@@ -72,17 +74,104 @@ def _save_api_key(key: str) -> None:
     except Exception:
         pass
 
+
+def _load_workspaces() -> list[str]:
+    """Load allowed workspace paths from config file (one path per line)."""
+    if _MCP_WORKSPACES_FILE.exists():
+        try:
+            lines = _MCP_WORKSPACES_FILE.read_text(encoding="utf-8").strip().splitlines()
+            return [l.strip() for l in lines if l.strip() and not l.strip().startswith("#")]
+        except Exception:
+            pass
+    return []
+
+
+def _save_workspaces(paths: list[str]) -> None:
+    """Persist workspace paths to config file."""
+    try:
+        _MCP_WORKSPACES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _MCP_WORKSPACES_FILE.write_text("\n".join(paths) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _kill_existing_on_port(port: int) -> bool:
+    """Kill any process listening on the given port. Returns True if killed."""
+    try:
+        if os.name == "nt":
+            result = subprocess.run(
+                ["netstat", "-ano"], capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.splitlines():
+                if f":{port}" in line and "LISTENING" in line:
+                    parts = line.split()
+                    pid = int(parts[-1])
+                    if pid > 0:
+                        subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                                       capture_output=True, timeout=5)
+                        return True
+        else:
+            result = subprocess.run(
+                ["lsof", "-ti", f":{port}"], capture_output=True, text=True, timeout=5,
+            )
+            if result.stdout.strip():
+                for pid in result.stdout.strip().split("\n"):
+                    subprocess.run(["kill", "-9", pid.strip()], capture_output=True, timeout=5)
+                return True
+    except Exception:
+        pass
+    return False
+
+
 mcp = FastMCP(name="unified-mcp-server")
 
 
 # ─── Path Safety ─────────────────────────────────────────────────────────────
 
+_ws_file_mtime: float = 0.0
+
+
+def _refresh_workspaces():
+    global ALLOWED_WORKSPACES, _ws_file_mtime
+    try:
+        mt = _MCP_WORKSPACES_FILE.stat().st_mtime if _MCP_WORKSPACES_FILE.exists() else 0.0
+    except OSError:
+        return
+    if mt > _ws_file_mtime:
+        _ws_file_mtime = mt
+        saved = _load_workspaces()
+        ALLOWED_WORKSPACES = [Path(p).resolve() for p in saved if p]
+        if WORKSPACE not in ALLOWED_WORKSPACES:
+            ALLOWED_WORKSPACES.insert(0, WORKSPACE)
+
+
 def safe_path(relative: str) -> Path:
-    """Resolve a path. Absolute paths are used as-is, relative paths are resolved from workspace."""
+    _refresh_workspaces()
     p = Path(relative)
     if p.is_absolute():
-        return p.resolve()
+        resolved = p.resolve()
+        if ALLOWED_WORKSPACES:
+            for ws in ALLOWED_WORKSPACES:
+                try:
+                    resolved.relative_to(ws)
+                    return resolved
+                except ValueError:
+                    continue
+            raise ValueError(f"Path '{relative}' is not under any allowed workspace")
+        return resolved
     return (WORKSPACE / relative).resolve()
+
+
+def _display_path(p: Path) -> str:
+    for ws in ALLOWED_WORKSPACES:
+        try:
+            return str(p.relative_to(ws))
+        except ValueError:
+            continue
+    try:
+        return str(_display_path(p))
+    except ValueError:
+        return str(p)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -131,7 +220,7 @@ async def write_file(
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
-        return {"ok": True, "path": str(p.relative_to(WORKSPACE)), "bytes": len(content.encode("utf-8"))}
+        return {"ok": True, "path": str(_display_path(p)), "bytes": len(content.encode("utf-8"))}
     except Exception as e:
         return {"error": f"Write error: {e}"}
 
@@ -167,7 +256,7 @@ async def edit_file(
         new_text = text.replace(old_string, new_string, 1)
 
     p.write_text(new_text, encoding="utf-8")
-    return {"ok": True, "replacements": count if replace_all else 1, "path": str(p.relative_to(WORKSPACE))}
+    return {"ok": True, "replacements": count if replace_all else 1, "path": str(_display_path(p))}
 
 
 @mcp.tool
@@ -182,10 +271,10 @@ async def delete_file(
     try:
         if p.is_dir():
             shutil.rmtree(p)
-            return {"ok": True, "deleted": str(p.relative_to(WORKSPACE)), "type": "directory"}
+            return {"ok": True, "deleted": str(_display_path(p)), "type": "directory"}
         else:
             p.unlink()
-            return {"ok": True, "deleted": str(p.relative_to(WORKSPACE)), "type": "file"}
+            return {"ok": True, "deleted": str(_display_path(p)), "type": "file"}
     except Exception as e:
         return {"error": f"Delete error: {e}"}
 
@@ -246,7 +335,7 @@ async def file_info(
     try:
         stat = p.stat()
         return {
-            "path": str(p.relative_to(WORKSPACE)),
+            "path": str(_display_path(p)),
             "type": "directory" if p.is_dir() else "file",
             "size_bytes": stat.st_size,
             "size_human": _human_size(stat.st_size),
@@ -340,7 +429,7 @@ async def list_directory(
     except Exception as e:
         return {"error": f"List error: {e}"}
 
-    return {"path": str(p.relative_to(WORKSPACE)), "entries": entries, "count": len(entries)}
+    return {"path": str(_display_path(p)), "entries": entries, "count": len(entries)}
 
 
 @mcp.tool
@@ -389,7 +478,7 @@ async def tree(
         lines = lines[:500]
         lines.append(f"... (truncated, {len(lines)}+ entries)")
 
-    return {"tree": "\n".join(lines), "root": str(p.relative_to(WORKSPACE))}
+    return {"tree": "\n".join(lines), "root": str(_display_path(p))}
 
 
 @mcp.tool
@@ -400,7 +489,7 @@ async def create_directory(
     p = safe_path(path)
     try:
         p.mkdir(parents=True, exist_ok=True)
-        return {"ok": True, "path": str(p.relative_to(WORKSPACE))}
+        return {"ok": True, "path": str(_display_path(p))}
     except Exception as e:
         return {"error": f"Mkdir error: {e}"}
 
@@ -417,7 +506,7 @@ async def glob_search(
     matches = []
     try:
         for p in WORKSPACE.rglob(pattern):
-            rel = str(p.relative_to(WORKSPACE)).replace("\\", "/")
+            rel = str(_display_path(p)).replace("\\", "/")
             if p.is_dir():
                 rel += "/"
             matches.append(rel)
@@ -461,7 +550,7 @@ async def grep(
             text = p.read_text(encoding="utf-8", errors="replace")
             for i, line in enumerate(text.splitlines(), 1):
                 if regex.search(line):
-                    rel = str(p.relative_to(WORKSPACE)).replace("\\", "/")
+                    rel = str(_display_path(p)).replace("\\", "/")
                     results.append({"file": rel, "line": i, "text": line.strip()[:500]})
                     if len(results) >= max_results:
                         break
@@ -733,7 +822,7 @@ async def download_file(
         log.info("[download] Saved %d bytes -> %s", len(data), save_path.name)
         return {
             "ok": True,
-            "path": str(save_path.relative_to(WORKSPACE)),
+            "path": str(_display_path(save_path)),
             "bytes": len(data),
             "filename": filename,
         }
@@ -763,12 +852,12 @@ async def zip_files(
                 if not p.exists():
                     return {"error": f"Not found: {p_str}"}
                 if p.is_file():
-                    zf.write(p, p.relative_to(WORKSPACE))
+                    zf.write(p, _display_path(p))
                     count += 1
                 elif p.is_dir():
                     for f in p.rglob("*"):
                         if f.is_file():
-                            zf.write(f, f.relative_to(WORKSPACE))
+                            zf.write(f, _display_path(f))
                             count += 1
 
         return {"ok": True, "output": output, "files_added": count, "size_bytes": out_path.stat().st_size}
@@ -1214,6 +1303,76 @@ def _start_tunnel(port: int) -> tuple[subprocess.Popen | None, str]:
     return proc, tunnel_url
 
 
+def _start_named_tunnel(tunnel_name: str, port: int) -> tuple[subprocess.Popen | None, str]:
+    """Start a cloudflared named tunnel. Returns (process, configured_url).
+
+    Named tunnels have a fixed DNS route — the URL doesn't change between restarts.
+    Requires prior setup: cloudflared tunnel login + create + route dns.
+    """
+    cf_path = _check_cloudflared()
+    if not cf_path:
+        return None, ""
+
+    _cf_config_dir = Path.home() / ".cloudflared"
+    config_file = _cf_config_dir / "config.yml"
+
+    cmd = [cf_path, "tunnel", "run"]
+    if config_file.exists():
+        cmd.extend(["--config", str(config_file)])
+    cmd.append(tunnel_name)
+
+    try:
+        if os.name == "nt":
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        else:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+
+        import time as _time
+        _time.sleep(3)
+
+        if proc.poll() is not None:
+            stderr_out = proc.stderr.read().decode("utf-8", errors="replace")[:500] if proc.stderr else ""
+            log.error("Named tunnel '%s' exited immediately: %s", tunnel_name, stderr_out)
+            return None, ""
+
+        tunnel_url = _read_named_tunnel_url(tunnel_name)
+        return proc, tunnel_url
+
+    except Exception as e:
+        log.error("Failed to start named tunnel '%s': %s", tunnel_name, e)
+        return None, ""
+
+
+def _read_named_tunnel_url(tunnel_name: str) -> str:
+    """Read the configured hostname for a named tunnel from config.yml or tunnel info."""
+    _cf_config_dir = Path.home() / ".cloudflared"
+    config_file = _cf_config_dir / "config.yml"
+
+    if config_file.exists():
+        try:
+            content = config_file.read_text(encoding="utf-8")
+            match = re.search(r"hostname:\s*(\S+)", content)
+            if match:
+                hostname = match.group(1)
+                if not hostname.startswith("http"):
+                    hostname = f"https://{hostname}"
+                return hostname
+        except Exception:
+            pass
+
+    return f"https://{tunnel_name}.your-domain.com"
+
+
 def _interactive_setup(args) -> tuple[str, str, int]:
     """Interactive CLI setup. Returns (workspace, api_key, port)."""
     print()
@@ -1281,14 +1440,15 @@ def _interactive_setup(args) -> tuple[str, str, int]:
 
 
 def main():
-    global WORKSPACE, PROXY_API_KEY
+    global WORKSPACE, ALLOWED_WORKSPACES, PROXY_API_KEY
 
     parser = argparse.ArgumentParser(description="MCP Server (FastMCP + Streamable HTTP)")
     parser.add_argument("--port", type=int, default=9876, help="Listen port (default: 9876)")
-    parser.add_argument("--workspace", type=str, default="", help="Workspace directory")
+    parser.add_argument("--workspace", type=str, default="", help="Primary workspace directory")
     parser.add_argument("--api-key", type=str, default="", help="Unified proxy API key (sk-xxx)")
     parser.add_argument("--no-tunnel", action="store_true", help="Don't start cloudflared tunnel")
     parser.add_argument("--no-interactive", action="store_true", help="Skip interactive setup")
+    parser.add_argument("--named-tunnel", type=str, default="", help="Use cloudflared named tunnel (persistent URL)")
     args = parser.parse_args()
 
     # ── Interactive or direct mode ──
@@ -1301,9 +1461,21 @@ def main():
         if api_key:
             _save_api_key(api_key)
 
+    # ── Auto-kill existing MCP server on same port ──
+    if _kill_existing_on_port(port):
+        log.info("Killed existing process on port %d", port)
+        import time as _t
+        _t.sleep(1)
+
     WORKSPACE = Path(workspace).resolve()
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     PROXY_API_KEY = api_key
+
+    # ── Load allowed workspaces from config ──
+    saved_workspaces = _load_workspaces()
+    ALLOWED_WORKSPACES = [Path(p).resolve() for p in saved_workspaces if p]
+    if WORKSPACE not in ALLOWED_WORKSPACES:
+        ALLOWED_WORKSPACES.insert(0, WORKSPACE)
 
     if PROXY_API_KEY:
         key_display = PROXY_API_KEY[:8] + "..." + PROXY_API_KEY[-4:]
@@ -1322,7 +1494,20 @@ def main():
     # ── Start cloudflared tunnel ──
     tunnel_proc = None
     tunnel_url = ""
-    if not args.no_tunnel:
+    if args.named_tunnel:
+        cf_path = _check_cloudflared()
+        if cf_path:
+            print()
+            print(f"  Starting named tunnel '{args.named_tunnel}'...", end=" ", flush=True)
+            tunnel_proc, tunnel_url = _start_named_tunnel(args.named_tunnel, port)
+            if tunnel_proc:
+                print("OK")
+            else:
+                print("FAILED")
+        else:
+            print()
+            print("  cloudflared not found — install it or use --no-tunnel")
+    elif not args.no_tunnel:
         cf_path = _check_cloudflared()
         if cf_path:
             print()
@@ -1342,6 +1527,10 @@ def main():
     print(f"  MCP Server (FastMCP) — {len(tool_names)} tools")
     print(f"  Port:      {port}")
     print(f"  Workspace: {WORKSPACE}")
+    if len(ALLOWED_WORKSPACES) > 1:
+        print(f"  Allowed:   {len(ALLOWED_WORKSPACES)} paths")
+        for ws in ALLOWED_WORKSPACES:
+            print(f"             - {ws}")
     print(f"  API Key:   {key_display}")
     if tunnel_url:
         print(f"  Tunnel:    {tunnel_url}")
