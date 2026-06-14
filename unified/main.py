@@ -329,7 +329,9 @@ async def lifespan(app: FastAPI):
             else:
                 log.warning("Captcha solver failed to start — using 2captcha fallback")
         else:
-            log.info("Captcha solver not available (camoufox not installed)")
+            deps = solver_manager.check_deps()
+            missing = [k for k, v in deps.items() if not v and k != "xvfb_run"]
+            log.warning("Captcha solver unavailable — missing: %s. Run 'unifiedme fix' to install.", ", ".join(missing))
     except Exception as e:
         log.warning("Captcha solver startup error: %s", e)
 
